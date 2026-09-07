@@ -1,0 +1,24 @@
+############## Install instructions#####################
+
+To install zmbkposev3 just run the install.sh script.
+
+# chmod +x install.sh
+# ./install.sh
+
+Check the README file for help, or run:
+
+# zmbkposev3 --help
+
+to get some help.
+
+To uninstall service and program files:
+
+# zmbkposev3-uninstall
+
+To also remove config, logs, state files, and configured SFTP key:
+
+# zmbkposev3-uninstall --purge-all
+
+Backup files in WORKDIR are not removed by the uninstaller.
+
+########################################################

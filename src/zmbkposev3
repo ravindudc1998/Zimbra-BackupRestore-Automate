@@ -1,0 +1,2080 @@
+#!/bin/bash
+## Automatic vim seting if you are "modeline" on
+# vim: set ai tabstop=4:
+
+#####
+# zmbkposev3
+#
+# Bash script to hot backup and hot restore Zimbra Collaboration Suite Opensource
+#
+# Copyright (C) 2007 Rubens Alonso Filho <rubens@harv.com.br>
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of version 2 of the GNU General Public
+# License as published by the Free Software Foundation.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307
+# USA
+#
+# 26/10/2010 - Version 1.0.5 - By Alan Nikitiuk Milani
+#					       <alan.milani@4linux.com.br>
+#					       <niki.milani@gmail.com>
+#                          Bruno Gurgel
+#						   <bruno@4linux.com.br>
+#					       <bruno.gurgel@gmail.com>
+#
+#
+set -e
+INC_MARK=INC
+FULL_MARK=FULL
+HUMAN_DATE_FORMAT="%d/%m/%Y %H:%M:%S"
+DATE_TIME_MARK_FORMAT='%Y%m%d%H%M%S' #alphanumeric time sortable by the "sort" command
+CURL_args="-s -S -k -f"
+EXTRA_COMMAND_PATHS="/opt/zimbra/bin:/opt/zimbra/common/bin:/opt/zimbra/openldap/bin:/opt/zimbra/postfix/sbin"
+LDAP_FILE_IN_TAR=acct.ldif
+MAILBOX_FILE_IN_TAR=mailbox.tgz
+OSE_CONF="/etc/zmbkposev3"
+BACKUP_LOG_DIR="/var/log/zmbkpose"
+BACKUP_LOG_FILE="$BACKUP_LOG_DIR/zmbkpose-backup.log"
+BACKUP_LOG_HEADER="start_time,email,backup_location,backup_size,end_time,zmbkpose_command"
+RESTORE_LOG_FILE="$BACKUP_LOG_DIR/zmbkpose-restore.log"
+RESTORE_LOG_HEADER="start_time,email,backup_location,backup_size,end_time,zmbkpose_command,status"
+
+show_help ()
+{
+	cat<<-EOF 
+ Actions:
+    -f              Full backup
+    -F time         Conditional full backup. If last full backup is "time" old
+    -i              Incremental backup
+    -I time         Conditional inc. backup. If last inc backup is "time" old
+    -r              Restore accounts from last full and later incrementals
+    -R time         Restore accounts up to the point in cycle reached by now-time
+    -d time         Delete old backups, if them are "time" old
+    --rotate-full-count n
+                    Delete old backup cycles, keeping newest n full backups
+    -v              Verify backup archive files
+    -l,-m,-n        List all backups info(-l), only first backup(-m) or last(-n)
+
+ Options for actions:
+    -a act[,act]... Operates on specific accounts. Default all.
+    --admuser user  Use \"user\" as admin user for access to mailboxes
+    --admpw pw      Use \"pw\" as admin user password for access to mailboxes
+    --bf file       Backup to a specific tar file(don't use WORKDIR). Use - for stdout
+    --color mode    Colored status output: auto, always, never. Default auto
+    -c n            Limits the number of accounts in backups to "n"
+    -chldaph        In the restore in a different host, try to change some 
+                     attributes of LDAP for account work
+    -C time         Similar to "-c", backups up to reach the time "time"
+    -e time         Wait a time between each backup of an account
+    -h              This help
+    --ldaph host    Use "host" as ldap master server (if you restore in 
+	                  another host, use --chldaph arg.)
+    --ldapdn dn     Use "dn" for login to ldap server
+    --ldappw pw     Use "pw" as password for login to ldap server
+    --no-verify     Do not verify a backup archive after creating it
+    -p n            Backups in parallel, with a maximum of "n" instances
+    -q,--quiet      Suppress status output; errors are still shown
+    --rf file       Restore from a specific tar backup file 
+    -s              Simulation of operations as if they really do
+    -t              On incremental backup, do full is not previous incremental
+    -u              On failure of a backup account, does not stop.
+    --vf file       Verify a specific tar backup file
+ 
+ Usage: 
+   zmbkposev3 -d time [-s]
+         Delete backups older than ( now - time).  See "time FORMAT" below.
+          !!! Files are never deleted leaving inconsistent backups !!!
+         NOTE: if you have backups as follow, y execute it on Friday with "-d 1d":
+           Monday   : Backup FULL   *
+           Tuesday  : Backup INC    *
+           Wednesday: Backup FULL  
+           Thursday : Backup INC
+           Friday   : Backup INC
+         The backups with * will be deleted. If removed oldest backups than Friday,
+          (now - 1d) would remain an inconsistent backup.
+
+   zmbkposev3 --rotate-full-count n [ -a mail1,mail2 mail3 ] [-s]
+         Delete old backup cycles, keeping the newest n full backup cycles
+          for each account. n=0 removes all existing valid backup cycles.
+
+   zmbkposev3 -f [ -a mail1,mail2 mail3 ] [-s] [-c] [-C] [-e] [-u] [-p n] [--bf file] \\
+            [--admuser user] [--admpw pw] [--ldaph host] [--ldapdn dn] [--ldappw pw]
+         Full backup for all or specific accounts. 
+
+   zmbkposev3 -F time [ -a mail1,mail2 mail3 ] [-s] [-c] [-C] [-e] [-u] [-p n] [--bf file] \\
+            [--admuser user] [--admpw pw] [--ldaph host] [--ldapdn dn] [--ldappw pw]
+         Full backup for all or specific accounts only if the accounts don't have a
+          full backup from time. See "time FORMAT" below.
+
+   zmbkposev3 -i [ -a mail1,mail2 mail3 ] [-c] [-C] [-e] [-s] [-t] [-u] [-p n] [--bf file] \\
+            [--admuser user] [--admpw pw] [--ldaph host] [--ldapdn dn] [--ldappw pw]
+         Incremental backup (or full if no previous) for all or specific accounts.
+
+   zmbkposev3 -I time [ -a mail1,mail2 mail3 ] [-c] [-C] [-e] [-s] [-t] [-u] [-p n] [--bf file] \\
+            [--admuser user] [--admpw pw] [--ldaph host] [--ldapdn dn] [--ldappw pw]
+         Incremental backup for all or specific accounts only if the accounts 
+          don't have a inc. backup from time. See "time FORMAT" below.
+
+   zmbkposev3 -l [ -a mail1,mail2 mail3 ]
+         List mailbox backup copies for all or specific accounts.
+
+   zmbkposev3 -m [ -a mail1,mail2 mail3 ]
+         List first mailbox backup copy for all or specific accounts.
+
+   zmbkposev3 -n [ -a mail1,mail2 mail3 ]
+         List last mailbox backup copy for all or specific accounts.
+
+   zmbkposev3 -v [ -a mail1,mail2 mail3 ] [--vf file]
+         Verify backup archive files. It checks the outer tar, acct.ldif,
+          and mailbox.tgz tar-gzip content for mailbox account backups.
+         This does not contact the Zimbra server.
+
+   zmbkposev3 -r [ -a mail1,mail2 mail3 ] [-s] [--rf file] \\
+            [--admuser user] [--admpw pw] [--ldaph host] [--ldapdn dn] [--ldappw pw]
+         Restore last backup cycle(last full + later incrementals) for all or 
+          specific accounts. Without -a, restore accounts found in WORKDIR
+          backup storage using the WORKDIR/domain/user layout in domain/user A-Z order.
+
+   zmbkposev3 -R time [ -a mail1,mail2 mail3 ] [-s] \\
+            [--admuser user] [--admpw pw] [--ldaph host] [--ldapdn dn] [--ldappw pw]
+         Restore for all or specific accounts up to the point in cycle (full and later incs.)
+          reached by ( now - time ). time can be:
+           * interval specified by "time FORMAT" (see below). The restore will be
+              up to ( now - time ).
+           * absolute time mark in internal format expresed by "date" 
+              command using '$DATE_TIME_MARK_FORMAT' format.
+           * a dash (-) for restore all backups starting with the oldest
+
+   time FORMAT:
+   -----------
+         Time can be expresed in format n[smhdwM], where n is a number, "s" for 
+         seconds "m" for minutes, "h" for hours, "d" for days, "w" for weeks, 
+         and "M" for months.
+	EOF
+}
+
+function use_color(){
+	case "${COLOR_MODE:-auto}" in
+		(always) return 0 ;;
+		(never) return 1 ;;
+		(auto) [ -t 2 ] && [ -z "$NO_COLOR" ] ;;
+		(*) return 1 ;;
+	esac
+}
+
+function log_msg(){
+	local level="$1"
+	local color="$2"
+	shift 2
+
+	local date_time line
+	date_time=$($DATE_cmd '+%F %T')
+	line=$(printf '%s %s: %s' "$date_time" "$level" "$*")
+
+	if [ "${QUIET_MODE:-no}" != yes -o "$level" = ERROR ];then
+		if use_color;then
+			printf '%s \033[%sm%s\033[0m: %s \n' "$date_time" "$color" "$level" "$*" >&2
+		else
+			printf '%s\n' "$line" >&2
+		fi
+	fi
+}
+
+debug()
+{
+	log_msg DEBUG 36 "$@"
+}
+
+ok()
+{
+	log_msg OK 32 "$@"
+}
+
+warn()
+{
+	log_msg WARN 33 "$@"
+}
+
+error()
+{
+	log_msg ERROR 31 "$@"
+}
+
+function backup_log_csv_field(){
+	local value="$1"
+	value=${value//\"/\"\"}
+	printf '"%s"' "$value"
+}
+
+function backup_log_command(){
+	local arg hide_next output
+	hide_next=
+	output="${0##*/}"
+
+	for arg in "$@";do
+		if [ -n "$hide_next" ];then
+			output="${output}${output:+ }<hidden>"
+			hide_next=
+			continue
+		fi
+		case "$arg" in
+			--admpw|--ldappw)
+				output="${output}${output:+ }$arg"
+				hide_next=yes
+			;;
+			--admpw=*|--ldappw=*)
+				output="${output}${output:+ }${arg%%=*}=<hidden>"
+			;;
+			(*)
+				output="${output}${output:+ }$arg"
+			;;
+		esac
+	done
+	printf '%s' "$output"
+}
+
+function backup_log_entry(){
+	local start_time="$1"
+	local account="$2"
+	local backup_file="$3"
+	local backup_size="$4"
+	local end_time="$5"
+	local command_line="$6"
+
+	[ -z "$backup_file" -o "$backup_file" = "-" ] && return 0
+	if [ ! -d "$BACKUP_LOG_DIR" ];then
+		debug "BACKUP LOG: $BACKUP_LOG_DIR does not exist. Skipping CSV backup log."
+		return 0
+	fi
+	if [ ! -e "$BACKUP_LOG_FILE" ];then
+		printf '%s\n' "$BACKUP_LOG_HEADER" >> "$BACKUP_LOG_FILE" 2>/dev/null || {
+			debug "BACKUP LOG: Cannot write $BACKUP_LOG_FILE. Skipping CSV backup log."
+			return 0
+		}
+	elif [ ! -s "$BACKUP_LOG_FILE" ];then
+		printf '%s\n' "$BACKUP_LOG_HEADER" >> "$BACKUP_LOG_FILE" 2>/dev/null || {
+			debug "BACKUP LOG: Cannot write $BACKUP_LOG_FILE. Skipping CSV backup log."
+			return 0
+		}
+	fi
+
+	{
+		backup_log_csv_field "$start_time"; printf ','
+		backup_log_csv_field "$account"; printf ','
+		backup_log_csv_field "$backup_file"; printf ','
+		backup_log_csv_field "$backup_size"; printf ','
+		backup_log_csv_field "$end_time"; printf ','
+		backup_log_csv_field "$command_line"; printf '\n'
+	} >> "$BACKUP_LOG_FILE" 2>/dev/null || \
+		debug "BACKUP LOG: Cannot write $BACKUP_LOG_FILE. Skipping CSV backup log."
+}
+
+function restore_log_files_field(){
+	echo "$1" | $AWK_cmd '
+		NF {
+			if (out) out=out ";" $0
+			else out=$0
+		}
+		END { print out }
+	'
+}
+
+function restore_log_files_size(){
+	local restore_files="$1"
+	local file size_b total_b size unit
+	total_b=0
+
+	while IFS= read -r file;do
+		[ -z "$file" ] && continue
+		[ -f "$file" ] || continue
+		size_b=$($STAT_cmd --printf='%s' "$file" 2>/dev/null || printf '0')
+		total_b=$(( total_b + size_b ))
+	done<<-RESTORE_FILES
+		$restore_files
+		RESTORE_FILES
+
+	size=$total_b
+	unit=B
+	if [ "$total_b" -ge 1099511627776 ];then
+		size=$(( total_b / 1099511627776 ))
+		unit=T
+	elif [ "$total_b" -ge 1073741824 ];then
+		size=$(( total_b / 1073741824 ))
+		unit=G
+	elif [ "$total_b" -ge 1048576 ];then
+		size=$(( total_b / 1048576 ))
+		unit=M
+	elif [ "$total_b" -ge 1024 ];then
+		size=$(( total_b / 1024 ))
+		unit=K
+	fi
+	printf '%s%s' "$size" "$unit"
+}
+
+function restore_log_entry(){
+	local start_time="$1"
+	local account="$2"
+	local restore_files="$3"
+	local backup_size="$4"
+	local end_time="$5"
+	local command_line="$6"
+	local status="$7"
+	local backup_location
+
+	if [ ! -d "$BACKUP_LOG_DIR" ];then
+		debug "RESTORE LOG: $BACKUP_LOG_DIR does not exist. Skipping CSV restore log."
+		return 0
+	fi
+	if [ ! -e "$RESTORE_LOG_FILE" ];then
+		printf '%s\n' "$RESTORE_LOG_HEADER" >> "$RESTORE_LOG_FILE" 2>/dev/null || {
+			debug "RESTORE LOG: Cannot write $RESTORE_LOG_FILE. Skipping CSV restore log."
+			return 0
+		}
+	elif [ ! -s "$RESTORE_LOG_FILE" ];then
+		printf '%s\n' "$RESTORE_LOG_HEADER" >> "$RESTORE_LOG_FILE" 2>/dev/null || {
+			debug "RESTORE LOG: Cannot write $RESTORE_LOG_FILE. Skipping CSV restore log."
+			return 0
+		}
+	fi
+
+	backup_location=$(restore_log_files_field "$restore_files")
+	{
+		backup_log_csv_field "$start_time"; printf ','
+		backup_log_csv_field "$account"; printf ','
+		backup_log_csv_field "$backup_location"; printf ','
+		backup_log_csv_field "$backup_size"; printf ','
+		backup_log_csv_field "$end_time"; printf ','
+		backup_log_csv_field "$command_line"; printf ','
+		backup_log_csv_field "$status"; printf '\n'
+	} >> "$RESTORE_LOG_FILE" 2>/dev/null || \
+		debug "RESTORE LOG: Cannot write $RESTORE_LOG_FILE. Skipping CSV restore log."
+}
+
+################################################################################
+# LDAP functions ###############################################################
+################################################################################
+
+#
+## Get ldap attributes from a mailbox account
+function ldap_get_mailbox_atts()
+{
+	local mailbox="$1"
+	local ldap_req_atts="$2"
+	ldap_search "(mail=$mailbox)" "$ldap_req_atts" 
+}
+
+#
+## Do unwrap ldap lines from ldapsearch results
+## Thanks Rich Megginson : http://richmegginson.livejournal.com/18726.html
+function ldap_unwrap_ldif()
+{
+	$SED_cmd -n '1 {h; $ !d;}; $ {x; s/\n //g; p;}; /^ / {H; d;}; /^ /! {x; s/\n //g; p;}'
+}
+
+#
+## Do ldap search and get specific attributes using a ldap_filter 
+function ldap_search()
+{
+	local ldap_filter="$1"
+	local ldap_req_atts="$2"
+	local ldap_base_dn="${3}"
+
+	$LDAPSEARCH_cmd -x -H "$LDAPMASTERSERVER" \
+		-D "$LDAPZIMBRADN" -w "$LDAPZIMBRAPASS" -b "$ldap_base_dn" \
+		-LLL "$ldap_filter" $ldap_req_atts | ldap_unwrap_ldif
+}
+
+#
+## Test $LDAPMASTERSERVER", using  $LDAPZIMBRADN and $LDAPZIMBRAPASS 
+function ldap_test_server()
+{
+	debug "Testing ldapserver $LDAPMASTERSERVER, using user $LDAPZIMBRADN"
+	ldap_search "($LDAPZIMBRADN)" uid "$LDAPZIMBRADN"
+}
+
+#
+## Get accounts from ldap
+function ldap_get_accts()
+{
+	ldap_search "(objectclass=zimbraAccount)" "zimbraMailDeliveryAddress" \
+		| $GREP_cmd ^zimbraMailDeliveryAddress | $AWK_cmd '{print $2}'
+}
+
+#
+## Get groups from ldap
+function ldap_get_groups()
+{
+	#Get email of ldap groups is not trivial, because zimbra saves 
+	# it in the "zimbraMailAlias" attribute. If the group contains 
+	# an alias, these email too is saved in the "zimbraMailAlias" 
+	# attribute. This code try to implicate the "uid" attribute for 
+	# determine the correct mail value.
+	for dn in $(
+		ldap_search "(objectclass=zimbraDistributionList)" "dn"| $GREP_cmd '^dn:'| $AWK_cmd '{print $2}'
+		);do
+		uid=$(ldap_search "(objectclass=*)" "uid" "$dn" |$GREP_cmd '^uid'|$AWK_cmd '{print $2}')
+		ldap_search "(objectclass=*)" "mail" "$dn" |$EGREP_cmd "^mail: *$uid@"|$AWK_cmd '{print $2}'
+	done
+}
+
+#
+## Add ldap entry
+function ldap_add(){
+	$LDAPADD_cmd -x -H "$LDAPMASTERSERVER" \
+		-D "$LDAPZIMBRADN" -w "$LDAPZIMBRAPASS" >&2
+}
+
+#
+## Check if ldap dn exists 
+function ldap_dn_exists()
+{
+	local dn="$1"
+	local ldap_data
+	ldap_data=$(ldap_search "(objectClass=*)" dn "$dn" 2>/dev/null) || true
+	test -n "$ldap_data" 
+}
+
+#
+## Get atribute ldap attribute from ldif data in stdin
+function ldif_analysis_get_att()
+{
+	local attribute="$1"
+	local multivalued="$2"
+	local sed_quit=';q' ; [ -n "$multivalued" ] && unset sed_quit
+	$SED_cmd -n -r -e "/^$attribute::? /{s/^$attribute::? (.*)/\1/;p$sed_quit}"
+}
+
+#
+## Get zimbra account type (ACCOUNT|GROUP) from ldap attributes in file or stdin
+function ldif_analysis_account_type()
+{
+	for objectClass in $(ldif_analysis_get_att objectClass y);do
+		case $objectClass in
+			zimbraDistributionList) echo -n GROUP && return ;;
+			zimbraAccount) echo -n ACCOUNT && return ;;
+		esac
+	done
+}
+
+
+#
+## Get entry dn based, from ldif data in stdin
+function ldif_analysis_get_entry()
+{
+	local dn="$1"
+	$AWK_cmd -v dn="dn: $dn" '
+		$0 == dn { printing=1 }
+		printing { print }
+		printing && $0 == "" { exit }
+	'
+}
+
+#
+## Try to automatically correct to attribute values for 
+##  zimbraMailHost and zimbraMailTransport ;based on user settings for
+##  admin
+function ldif_auto_change_MailHostConf()
+{
+	local admin_dn ldap_info
+	admin_dn=$(ldap_search "(uid=admin)" dn ""| $SED_cmd -r -n -e '1s/^dn: (.*)/\1/p')
+	[ -z "$admin_dn" ] && $SED_cmd -n p && return 0
+	ldap_info=$(ldap_search "(uid=admin)" "zimbraMailHost zimbraMailTransport" "$admin_dn")
+	at_zimbraMailHost=$(echo "$ldap_info"|$SED_cmd -r -n -e 's/^zimbraMailHost: (.*)/\1/p')
+	at_zimbraMailTransport=$(echo "$ldap_info"|$SED_cmd -r -n -e 's/^zimbraMailTransport: (.*)/\1/p')
+	[ -z "$at_zimbraMailHost" -o -z "$at_zimbraMailTransport" ] && $SED_cmd -n p && return 0
+	$SED_cmd -r -e "s/^(zimbraMailHost: ).*/\1$at_zimbraMailHost/ ; s/^(zimbraMailTransport: ).*/\1$at_zimbraMailTransport/"
+}
+
+################################################################################
+# ZIMBRA specific functions ####################################################
+################################################################################
+
+#
+## Do a zimbra ldap backup
+function zimbra_ldap_backup()
+{
+	local account="$1"
+	local backup_file="$2"
+
+	#Mailbox subtree 
+	local ldap_dn=$(ldap_get_mailbox_atts "$account" dn| 
+		$SED_cmd -r -n -e 's/dn: (.*)/\1/p')
+	[ -z "$ldap_dn" ] && error "$account - Account does not exists" && return 1
+	ldap_search '(objectclass=*)' '' "$ldap_dn" > "$backup_file"
+	[ -f "$backup_file" -a ! -s "$backup_file" ] && \
+		error "$account - Ldap backup empty" && return 1
+
+	#Alias entries
+	zimbraId=$($GREP_cmd "^zimbraId:" "$backup_file" | $AWK_cmd '{print $2}')
+	[ -z "$zimbraId" ] && \
+		error "$account - Ldap zimbra entry whithout zimbraID attribute." && return 1
+	ldap_search "(zimbraAliasTargetId=$zimbraId)" >> "$backup_file"
+}
+
+
+function zimbra_mailbox_backup()
+{
+	local mailbox="$1"
+	local mailhost="$2"
+	local search_query="$3"
+	local backup_file="$4"
+	local ret i
+
+	[ -n "$search_query" ] && search_query="&$search_query"
+
+	#Because sporadic ssl error, we will try several times. See issues 35.
+	for i in 1 2 3 4;do
+		$RM_cmd -f "$backup_file" 2>/dev/null || true
+		ret=0; $CURL_cmd $CURL_args -u "$ADMINUSER:$ADMINPASS" -o "$backup_file" \
+			"https://$mailhost:7071/home/$mailbox/?fmt=tgz$search_query" || ret=$?
+		if [ "$ret" -eq 0 ];then
+			if mailbox_tgz_is_valid "$backup_file";then
+				return 0
+			fi
+			debug "$mailbox - mailbox export try $i returned invalid tgz"
+			ret=90
+		else
+			debug "$mailbox - mailbox export try $i failed with curl code $ret"
+		fi
+		[ "$i" -lt 4 ] && sleep 3
+	done
+	error "$mailbox - Mailbox backup failed or returned invalid tgz after several attempts"
+	return 1
+}
+
+zimbra_mailbox_restore()
+{
+	local mailbox="$1"
+	local mailhost="$2"
+	local backup_file="${3:--}"
+	[ -z "$mailbox" -o -z "$mailhost" ] && return 1
+
+	#If backup_file is file, then check it 
+	if [ "$backup_file" != "-" ];then
+ 		[ ! -f "$backup_file" ] && return 1
+ 		[ ! -s "$backup_file" ] && return 0
+	fi
+
+
+	$CURL_cmd $CURL_args --data-binary "@$backup_file" -u "$ADMINUSER:$ADMINPASS" \
+	  "https://$mailhost:7071/home/$mailbox/?fmt=tgz&resolve=skip"
+}
+
+
+################################################################################
+# TIME functions ###############################################################
+################################################################################
+
+#
+## Current time-stamp on DATE_TIME_MARK format
+function time_cur_date_time_mark() {
+	$DATE_cmd "+$DATE_TIME_MARK_FORMAT" "$@"
+}
+
+#
+## Current time-stamp
+function time_cur_tt(){
+	$DATE_cmd "+%s" "$@"
+}
+
+#
+## Convert date-time format from $DATE_TIME_MARK_FORMAT to timestamp
+function time_cnv_date_time_mark_to_tt()
+{
+	$DATE_cmd --date="${1:0:4}-${1:4:2}-${1:6:2} ${1:8:2}:${1:10:2}:${1:12:2}" '+%s'
+}
+
+#
+## Convert date-time format from $DATE_TIME_MARK_FORMAT to human format
+function time_cnv_date_time_mark_to_human(){
+	#convert date format from "YYYYMMDDHHMMSS" to human format
+	$DATE_cmd --date="${1:0:4}-${1:4:2}-${1:6:2} ${1:8:2}:${1:10:2}:${1:12:2}" "+$HUMAN_DATE_FORMAT"
+}
+#
+## Convert date-time format from $DATE_TIME_MARK_FORMAT to human format in very large
+## stdin data (better perfomance that time_cnv_date_time_mark_to_human function)
+## NOTE: this function convert time betwen marks: <dc $DATE_TIME_MARK_FORMAT > 
+function pipe_date_time_conv(){
+        $AWK_cmd -v HUMAN_DATE_FORMAT="$HUMAN_DATE_FORMAT" '{
+                date_time_mark=gensub(/(.*)<dc ([0-9]+) >(.*)/,"\\2","g") ;
+                date_time_mark_h = strftime(HUMAN_DATE_FORMAT,mktime(      \
+                        substr(date_time_mark,1,4) " " \
+                        substr(date_time_mark,5,2) " " \
+                        substr(date_time_mark,7,2) " " \
+                        substr(date_time_mark,9,2) " " \
+                        substr(date_time_mark,11,2) " " \
+                        substr(date_time_mark,13,2) ));
+                print gensub(/(.*)<dc ([0-9]+) >(.*)/,"\\1\"" date_time_mark_h "\"\\3","g") ;
+                }'
+}
+
+
+
+#
+## date command in human format
+function human_date_time()
+{
+	$DATE_cmd "+$HUMAN_DATE_FORMAT" "$@"
+}
+
+#
+## Convert time expresion in format [0-9]+[smhdwM] to secs.
+function cnv_time_expr_to_secs()
+{
+	local time_exp="$1"
+
+	echo "$time_exp"|$EGREP_cmd -q '^[0-9]+[smhdwM]$'|| return 1
+	case $time_exp in 
+		*s) echo ${time_exp%s} ;; #Secs to secs
+		*m) echo $(( ${time_exp%m} * 60 ));; #Minutes to secs
+		*h) echo $(( ${time_exp%h} * 3600 ));; #Hours to secs
+		*d) echo $(( ${time_exp%d} * 86400 ));; #Days to secs
+		*w) echo $(( ${time_exp%w} * 604800 ));; #Weeks to secs
+		*M) echo $(( ${time_exp%M} * 2592000 ));; #Months to secs
+	esac
+}
+
+#
+## Check if arg. is a valid date-time mark, and return it
+function is_date_time_mark()
+{
+	echo "$1"|$EGREP_cmd '^[0-9]{14}$'
+}
+
+################################################################################
+# BACKUP db functions ##########################################################
+################################################################################
+
+#
+## Convet user@domain to domain/user
+function convert_account_to_structure(){
+	local account="$1"
+	local local_part="${account%@*}"
+	local domain="${account#*@}"
+	if [ "$domain" = "$account" ];then
+		echo "$account"
+	else
+		echo "$domain/$local_part"
+	fi
+}
+
+#
+## Get expected backup directory for an account.
+function get_account_backup_dir(){
+	local account="$1"
+	echo "${WORKDIR}/$(convert_account_to_structure "$account")"
+}
+
+#
+## Get files from backup account
+function get_backups_account(){
+	local account="$1"
+	local position="$2" # Optional FIRST|LAST
+	local order="$3" #Optional ASC|DESC
+	local account_dir
+	account_dir=$(get_account_backup_dir "$account")
+
+	[ -n "$position" -a "$position" != FIRST -a "$position" != LAST ] && unset position
+	[ -n "$order" -a "$order" != ASC -a "$order" != DESC ] && order=ASC
+	local sort_order=''; [ "$order" = DESC ] && sort_order='-r'
+
+	[ ! -d "$account_dir" ] && return 0
+
+	#LAST link exists?
+	if [ "$position" = LAST  -a -L "$account_dir/LAST" -a \
+		-f "$($READLINK_cmd -f "$account_dir/LAST")" ] ;then
+		$READLINK_cmd -f "$account_dir/LAST"
+		return 0
+	fi
+
+	$FIND_cmd "$account_dir" -maxdepth 1 -mindepth 1 -type f|\
+		$SORT_cmd $sort_order |\
+		( if [ "$position" = LAST ];then
+			$SED_cmd -n '$p' 
+	  	elif [ "$position" = FIRST ];then
+			$SED_cmd -n '1p' 
+	  	else
+			cat
+	  	fi
+		)
+}
+
+#
+## Get backup cycles (full and subsequent incrementals) prior to end 
+##  date($date_time_mark_until),  ordered by time (oldest first).
+## This function is designed to delete old backups, and always tries 
+##  to keep at least one backup cycle, not returning it. If you want 
+##  to delete all backups for a user, do it yourself from the filesystem.
+function get_backup_cycles_older_than(){
+	local account="$1"
+	local date_time_mark_until="$2"
+	local cycles_to_ignore=''
+	[ -z "$date_time_mark_until" ] && return 1
+
+	while read date_time_mark full_inc bkfile ;do 
+		[ -z "$date_time_mark" ] && continue
+		#Skip backups after to end date
+		[ "$date_time_mark" -gt "$date_time_mark_until" ] && continue
+		#Search for start of cycle
+		if [ -z "$cycles_to_ignore" -a "$full_inc" != FULL ];then
+			continue
+		elif [ -z "$cycles_to_ignore" ];then
+			#Here is the beginning of cycle one full backup
+			cycles_to_ignore=y
+			continue
+		fi
+		#Older backup files
+		echo "$bkfile"
+	done<<-BACKUP_LIST | $SORT_cmd
+		$(get_backups_account "$account" "" DESC | 
+			get_from_backup_file_name DATE_TIME_MARK FULL_INC FULL_PATH
+		)
+		BACKUP_LIST
+}
+
+#
+## Get backup files outside of the newest n full backup cycles.
+function get_backup_cycles_exceeding_full_count(){
+	local account="$1"
+	local full_count_to_keep="$2"
+	local full_count delete_full_count deleting_full_count
+
+	[ -z "$full_count_to_keep" ] && return 0
+	full_count=$(get_backups_account "$account" |\
+		get_from_backup_file_name DATE_TIME_MARK FULL_INC FULL_PATH |\
+		$AWK_cmd -v full_mark="$FULL_MARK" '$2 == full_mark { count++ } END { print count + 0 }')
+	if [ "$full_count_to_keep" -le 0 ];then
+		get_backups_account "$account" | get_from_backup_file_name FULL_PATH
+		return 0
+	fi
+	[ "$full_count" -le "$full_count_to_keep" ] && return 0
+	delete_full_count=$(( full_count - full_count_to_keep ))
+	deleting_full_count=0
+
+	while read date_time_mark full_inc bkfile ;do
+		[ -z "$date_time_mark" ] && continue
+		if [ "$full_inc" = "$FULL_MARK" ];then
+			deleting_full_count=$(( deleting_full_count + 1 ))
+		fi
+		if [ "$deleting_full_count" -gt 0 -a "$deleting_full_count" -le "$delete_full_count" ];then
+			echo "$bkfile"
+		fi
+	done<<-BACKUP_LIST
+		$(get_backups_account "$account" | get_from_backup_file_name DATE_TIME_MARK FULL_INC FULL_PATH)
+		BACKUP_LIST
+}
+
+## Get files from last backup cycle (full and subsequent incrementals), 
+##  ordered by time (oldest first), ending with last backup without 
+##  exceeding the end date($date_time_mark_until)
+function get_last_backup_cycle_prior_to(){
+	local account="$1"
+	local date_time_mark_until="$2"
+	[ -z "$date_time_mark_until" ] && return 1
+
+	while read date_time_mark full_inc bkfile ;do 
+		[ -z "$date_time_mark" ] && continue
+		#Skip backups after to end date
+		[ "$date_time_mark_until" != '-' ] && [ "$date_time_mark" -gt "$date_time_mark_until" ] && 
+			continue
+		echo "$bkfile"
+		[ "$date_time_mark_until" != '-' -a "$full_inc" = FULL ] && break # Start of cycle
+	done<<-BACKUP_LIST | $SORT_cmd
+		$(get_backups_account "$account" "" DESC | 
+			get_from_backup_file_name DATE_TIME_MARK FULL_INC FULL_PATH
+		)
+		BACKUP_LIST
+}
+
+
+#
+## Get accounts with backups
+function get_accounts_in_backups(){
+	$FIND_cmd "${WORKDIR}" -maxdepth 2 -mindepth 2 -type d \
+		|$SORT_cmd \
+		|get_from_backup_file_name ACCOUNT
+}
+
+#
+## Calc file size from archs in stdin(one per line)
+function calc_files_size_in_stdin(){
+	local sep="$1"
+	local unit="$2" 
+	local size_b=0
+	local size=0
+
+	while IFS= read -r file;do
+		[ -z "$file" ] && continue
+		fsize_b=$($STAT_cmd --printf='%s' "$file")
+		if [ "$unit" = H_SIZE ] ;then # Human size
+			if   [ $fsize_b -lt 1024 ];then funit=B_SIZE
+			elif [ $fsize_b -lt 1048576 ];then funit=K_SIZE
+			elif [ $fsize_b -lt 1073741824 ];then funit=M_SIZE
+			elif [ $fsize_b -lt 1099511627776 ];then funit=G_SIZE
+			elif [ $fsize_b -lt 1125899906842624 ];then funit=T_SIZE
+			fi
+		else
+			funit=$unit
+		fi
+		case "$funit" in
+			B_SIZE)fsize=$fsize_b; funit=B ;;
+			K_SIZE)fsize=$(( $fsize_b / 1024 )) ; funit=K ;;
+			M_SIZE)fsize=$(( $fsize_b / 1024 / 1024 )) ; funit=M ;;
+			G_SIZE)fsize=$(( $fsize_b / 1024 / 1024 / 1024 )) ; funit=G;;
+			T_SIZE)fsize=$(( $fsize_b / 1024 / 1024 / 1024 / 1024 )); funit=T ;;
+		esac
+		echo "${file}${sep}${fsize}${funit}"
+	done
+}
+
+
+#
+## Extract information from backup file names
+function get_from_backup_file_name(){
+	local what='';
+	while [ -n "$1" ];do
+		case "$1" in
+			WORKDIR)	 	  what="${what}${what:+ }\1";;
+			DOMAIN)		 	  what="${what}${what:+ }\2";;
+			EMAIL)			  what="${what}${what:+ }\3";;
+			ACCOUNT)	 	  what="${what}${what:+ }\3\@\2";;
+			DATE_TIME_MARK)   what="${what}${what:+ }\4";;
+			DATE_TIME_MARK_H) what="${what}${what:+ }<dc \4 >"; local dc=1;;
+			FULL_INC)	 	  what="${what}${what:+ }\6";;
+			ARCH_FORMAT) 	  what="${what}${what:+ }\7";;
+			FULL_PATH) 		  what="${what}${what:+ }\1\/\2\/\3\/\4\5\6\.\7";;
+			H_SIZE) 	      what="${what}${what:+ }\8";local cs=1;local u=$1;;
+			*) true;;	
+		esac
+		shift 1
+	done
+	[ -z "$what" ] && return 0
+	cat "$@"| \
+	  if [ -n "$cs" ];then calc_files_size_in_stdin '|' $u;else cat;fi |\
+	  $SED_cmd -n -r \
+	    "s/(${WORKDIR//\//\\/})\/([A-Za-z0-9._%+-]+)\/([A-Za-z0-9._%+-]+)\/?([0-9]{14})?([:_-])?($FULL_MARK|$INC_MARK)?\.?(tar)?\|?([0-9]+[BKMGT])?(.*)/$what/p" |\
+	  if [ -z "$dc" ];then cat ;else pipe_date_time_conv ;fi # Date conversion 
+}
+
+#
+## Get the date and time of last backup 
+function get_account_date_time_mark_last_backup(){
+	local account="$1"
+	get_backups_account "$account" LAST |get_from_backup_file_name DATE_TIME_MARK
+}
+
+#
+## Get date_time mark from last full backup
+function get_date_time_mark_last_full_backup(){
+	local account="$1"
+	get_backups_account "$account" |\
+		get_from_backup_file_name DATE_TIME_MARK FULL_INC |\
+		$EGREP_cmd "$FULL_MARK$" |\
+		$SED_cmd -n -e '$p' |\
+		$AWK_cmd '{print $1}'
+}
+
+#
+## Get date_time mark from last full backup
+function get_date_time_mark_last_inc_backup(){
+	local account="$1"
+	get_backups_account "$account" |\
+		get_from_backup_file_name DATE_TIME_MARK FULL_INC |\
+		$EGREP_cmd "$INC_MARK$" |\
+		$SED_cmd -n -e '$p' |\
+		$AWK_cmd '{print $1}'
+}
+
+#
+## Get information from account backups
+get_account_backups_info(){
+	local position="$1" # (FIRST|LAST|any) :Get info from first/last/any backup
+	shift 1
+	local accounts="$@"
+	[ -z "$accounts" -o -z "$position" ] && return 1
+
+	( for account in $accounts;do
+		get_backups_account "$account" $position 
+	done 
+	) | get_from_backup_file_name ACCOUNT DATE_TIME_MARK_H FULL_INC H_SIZE #| \
+	#( while read account date_time_mark full_inc hsize;do 
+		#[ -z "$account" ] && continue
+		##human_date_time=$(time_cnv_date_time_mark_to_human $date_time_mark)
+		##$PRINTF_cmd "%s \"%s\" %s %s\n" "$account" "$human_date_time" $full_inc $hsize
+		#$PRINTF_cmd "%s \"%s\" %s %s\n" "$account" "$date_time_mark" $full_inc $hsize
+	#done
+	#)
+
+	return 0
+}
+
+#
+## Verify one backup archive. This does not contact the Zimbra server.
+function verify_backup_file(){
+	local backup_file="$1"
+	local ldap_data ac_type
+
+	if [ -z "$backup_file" -o "$backup_file" = "-" ];then
+		error "VERIFY: You need to specify a backup tar file."
+		return 1
+	fi
+	if [ ! -f "$backup_file" ];then
+		error "VERIFY: File \"$backup_file\" does not exist."
+		return 1
+	fi
+	if [ ! -s "$backup_file" ];then
+		error "VERIFY: File \"$backup_file\" is empty."
+		return 1
+	fi
+	if ! $TAR_cmd -tf "$backup_file" >/dev/null 2>&1;then
+		error "VERIFY: \"$backup_file\" is not a readable tar archive."
+		return 1
+	fi
+	if ! $TAR_cmd -tf "$backup_file" "$LDAP_FILE_IN_TAR" >/dev/null 2>&1;then
+		error "VERIFY: \"$backup_file\" does not contain $LDAP_FILE_IN_TAR."
+		return 1
+	fi
+
+	ldap_data=$($TAR_cmd -O -xf "$backup_file" "$LDAP_FILE_IN_TAR" 2>/dev/null | ldap_unwrap_ldif)
+	if [ -z "$ldap_data" ];then
+		error "VERIFY: \"$backup_file\" contains an empty $LDAP_FILE_IN_TAR."
+		return 1
+	fi
+
+	ac_type=$(echo "$ldap_data" | ldif_analysis_account_type)
+	case "$ac_type" in
+		(ACCOUNT)
+			if ! $TAR_cmd -tf "$backup_file" "$MAILBOX_FILE_IN_TAR" >/dev/null 2>&1;then
+				error "VERIFY: \"$backup_file\" does not contain $MAILBOX_FILE_IN_TAR."
+				return 1
+			fi
+			if ! ( set -o pipefail; $TAR_cmd -O -xf "$backup_file" "$MAILBOX_FILE_IN_TAR" | $GZIP_cmd -cd | $TAR_cmd -tf - >/dev/null ) 2>/dev/null;then
+				error "VERIFY: \"$backup_file\" contains an invalid $MAILBOX_FILE_IN_TAR."
+				return 1
+			fi
+		;;
+		(GROUP)
+			true
+		;;
+		(*)
+			error "VERIFY: \"$backup_file\" has no zimbra account or distribution-list objectClass in $LDAP_FILE_IN_TAR."
+			return 1
+		;;
+	esac
+
+	ok "VERIFY: $backup_file"
+	return 0
+}
+
+function mailbox_tgz_is_valid(){
+	local mailbox_file="$1"
+
+	[ -s "$mailbox_file" ] || return 1
+	( set -o pipefail; $GZIP_cmd -cd "$mailbox_file" | $TAR_cmd -tf - >/dev/null ) 2>/dev/null
+}
+
+#
+## Verify all backup archives passed through stdin.
+function verify_backup_files(){
+	local status=0
+	local verified=0
+	local passed=0
+	local failed=0
+	local backup_file
+
+	while IFS= read -r backup_file;do
+		[ -z "$backup_file" ] && continue
+		let verified++ || true
+		if verify_backup_file "$backup_file";then
+			let passed++ || true
+		else
+			let failed++ || true
+			status=1
+		fi
+	done
+
+	if [ "$verified" -eq 0 ];then
+		error "VERIFY: No backup files found."
+		return 1
+	fi
+
+	if [ "$status" -eq 0 ];then
+		ok "VERIFY FINISHED: $verified checked, $passed OK, $failed failed"
+	else
+		error "VERIFY FINISHED: $verified checked, $passed OK, $failed failed"
+	fi
+	return "$status"
+}
+
+#
+## Verify backups from WORKDIR for one or more accounts.
+function verify_account_backups(){
+	local accounts="$@"
+	local account
+
+	[ -z "$accounts" ] && error "VERIFY: No accounts found in backup storage." && return 1
+	for account in $accounts;do
+		get_backups_account "$account"
+	done | verify_backup_files
+}
+
+#
+## Get account address stored in a backup archive's LDAP data.
+function get_account_from_backup_file(){
+	local backup_file="$1"
+	local ldap_data account
+
+	[ -z "$backup_file" -o ! -f "$backup_file" ] && return 1
+	ldap_data=$($TAR_cmd -O -xf "$backup_file" "$LDAP_FILE_IN_TAR" 2>/dev/null | ldap_unwrap_ldif) || return 1
+	account=$(echo "$ldap_data" | ldif_analysis_get_att zimbraMailDeliveryAddress)
+	[ -z "$account" ] && account=$(echo "$ldap_data" | ldif_analysis_get_att mail)
+	[ -z "$account" ] && return 1
+	echo "$account"
+}
+
+#
+## Find valid zmbkpose backup archives in a directory, regardless of filename.
+function get_valid_backup_archives_from_dir(){
+	local account_dir="$1"
+	local backup_file
+
+	[ -z "$account_dir" -o ! -d "$account_dir" ] && return 0
+	while IFS= read -r backup_file;do
+		[ -z "$backup_file" ] && continue
+		if $TAR_cmd -tf "$backup_file" "$LDAP_FILE_IN_TAR" >/dev/null 2>&1;then
+			echo "$backup_file"
+		fi
+	done<<-BACKUP_CANDIDATES
+		$($FIND_cmd "$account_dir" -maxdepth 1 -mindepth 1 -type f | $SORT_cmd)
+		BACKUP_CANDIDATES
+}
+
+#
+## Get accounts in order of need backup
+function get_accounts_in_order_of_need_backup(){
+	#Accts. in order of need backup, storage-based backup information
+	accounts_in_storage=$(
+	  $FIND_cmd -P "${WORKDIR}" -maxdepth 3 -mindepth 2 \
+		-type l -regex '.*/LAST' -printf "%h/%l\n" |\
+		get_from_backup_file_name DATE_TIME_MARK ACCOUNT |\
+		$SORT_cmd | $AWK_cmd '{print $2}'
+	)
+	debug "$(echo $accounts_in_storage|$WC_cmd -w) accounts in backup storage"
+
+	#Accts. in ldap
+	accounts_in_ldap=$(ldap_get_groups ; ldap_get_accts)
+	debug "$(echo $accounts_in_ldap|$WC_cmd -w) accounts in ldap server"
+
+	#Accts. without backup (diff btw. accounts_in_ldap and accounts_in_storage)
+	accounts_without_bk=$(
+		$DIFF_cmd -u <(for a in $accounts_in_ldap;do echo $a;done|sort) \
+		  <(for a in $accounts_in_storage;do echo $a;done|sort)| \
+		$GREP_cmd '^-[^-]'| $SED_cmd 's/^-//')
+	debug "$(echo $accounts_without_bk |$WC_cmd -w) accounts without backup"
+
+	#First accounts without backup, then accounts in order of need backup 
+	echo $accounts_without_bk $accounts_in_storage
+}
+
+
+#
+## Do a backup account
+function backup_account(){
+	local account="$1"
+	local mode="$2"
+	local backup_file="$3"
+	local query="$4"
+	local init_tt=$(time_cur_tt)
+	local start_time
+	start_time=$($DATE_cmd '+%F %T')
+	local user_bk_dir
+	user_bk_dir=$(get_account_backup_dir "$account")
+	local tmp_parent="${WORKDIR:-/tmp}"
+	local tmp_dir=''
+	
+	#Temporary dir for generate files
+	if [ -z "$SIMULATE" ] ;then
+		tmp_dir=$($MKTEMP_cmd --tmpdir="$tmp_parent" -d) 
+	fi
+
+	#Backup to WORKDIR
+	if [ -z "$backup_file" -a -z "$SIMULATE" ];then 
+		[ -d "$user_bk_dir" ] || mkdir -p "$user_bk_dir"
+		if [ "$mode" = "$FULL_MARK" ];then
+			rotate_before_full_backup "$account" "${BACKUP_KEEP_FULL:-0}"
+		fi
+		backup_file="$user_bk_dir/$(time_cur_date_time_mark):$mode.tar"
+		until ( set -o noclobber; { > "$backup_file" ; } &> /dev/null );do
+			sleep 1
+			backup_file="$user_bk_dir/$(time_cur_date_time_mark):$mode.tar"
+		done
+	elif [ "$backup_file" != "-" -a -f "$backup_file" ];then 
+			error "File: \"$backup_file\", already exists."
+			return 1
+	fi
+
+	#Remove all if error, or return
+	trap 'ret=$?;
+	      if [ "$ret" -ne 0 ] && [ -n "$backup_file" ] && [ "$backup_file" != "-" ] && [ -f "$backup_file" ];then
+			rm -f "$backup_file";
+	      fi;
+	      [ -n "$tmp_dir" ] && [ -d "$tmp_dir" ] && rm -rf "$tmp_dir";
+	      trap - ERR RETURN SIGINT' ERR RETURN SIGINT
+
+	debug "$account - START $mode backup ..."
+
+	#Ldap backup
+	local ldap_bkf="${tmp_dir}/${LDAP_FILE_IN_TAR}"
+	debug "$account - Doing ldap backup ..."
+	if [ -z "$SIMULATE" ] ;then
+		zimbra_ldap_backup "$account" "$ldap_bkf" 
+		debug "$account - ldap backup complete"
+	else
+		debug "$account - skip ldap backup (simulation)"
+	fi
+
+	#Mailbox backup
+	debug "$account - Doing mailbox backup ..."
+	if [ ! -z "$SIMULATE" ];then
+		debug "$account - skip mailbox backup (simulation)"
+		return 0 
+	fi
+	local mbox_bkf="${tmp_dir}/${MAILBOX_FILE_IN_TAR}"
+	# backup is dependent on the type of account
+	local ac_type;ac_type=$(ldif_analysis_account_type < "$ldap_bkf") 
+	if [ "$ac_type" != ACCOUNT ];then 
+		debug "$account - No a mail account. Skipping mailbox backup." 
+	else
+		#Mailbox backup
+		local mailhost;mailhost=$(ldif_analysis_get_att zimbraMailHost < "$ldap_bkf")
+		[ -z "$mailhost" ] && \
+			debug "$account - No zimbraMailHost ldap attribute." && return 1
+		[ -z "$SIMULATE" ] && { zimbra_mailbox_backup "$account" "$mailhost" \
+			"$query" "$mbox_bkf"  || return 1 ;}
+		debug "$account - mailbox backup complete"
+	fi
+
+	#Final backup file
+	local files_in_tar=''
+	[ ! -s "$ldap_bkf" ] || files_in_tar="$files_in_tar $(basename "$ldap_bkf")"
+	[ ! -s "$mbox_bkf" ] || files_in_tar="$files_in_tar $(basename "$mbox_bkf")" 
+	if [ "$backup_file" = - ];then #Backup to stdout?
+		[ -z "$files_in_tar" ] || $TAR_cmd -c -C "$tmp_dir" $TAR_ARGS -O $files_in_tar
+	else
+		[ -z "$files_in_tar" ] || $TAR_cmd -c -C "$tmp_dir" $TAR_ARGS -f "$backup_file" $files_in_tar
+	fi
+	[ ! -f "$backup_file" ] || debug "$account - generated tar file $backup_file"
+
+	#Verify final backup before updating LAST link
+	if [ "$backup_file" != "-" -a -f "$backup_file" -a "$VERIFY_BACKUP_AFTER_CREATE" != no ];then
+		debug "$account - Verifying generated backup ..."
+		verify_backup_file "$backup_file" || return 1
+	fi
+
+	#Link to last backup
+	if [ "$backup_file" != "-" -a -f "$backup_file" ] ;then
+		local backup_size end_time command_line
+		backup_size=$($DU_cmd -h "$backup_file"|$AWK_cmd '{print $1}')
+		debug "$account - backup size is $backup_size"
+		end_time=$($DATE_cmd '+%F %T')
+		command_line=$(backup_log_command "${ZMBKPOSE_ORIGINAL_ARGS[@]}")
+		backup_log_entry "$start_time" "$account" "$backup_file" "$backup_size" "$end_time" "$command_line"
+		case "$backup_file" in
+			"$WORKDIR"/*)
+				$LN_cmd -fs "${backup_file##*/}" "${backup_file%/*}/LAST"
+			;;
+		esac
+	fi
+	debug "$account - END in $(( $(time_cur_tt) - $init_tt ))secs,"
+}
+
+backup_account_incremental()
+{
+	local account="$1"
+	local mode="$2"
+	local backup_to_file="$3"
+	
+	local last_from=$(get_account_date_time_mark_last_backup "$account")
+
+	if [ -z "$last_from" ]; then
+		if [ "$DO_FULL_IF_NO_PREV_INC" = yes ];then
+			debug "$account - No previous inc. backup. Doing FULL..."
+			backup_account "$account" "$FULL_MARK" "$backup_to_file"
+			return 0
+		else
+			debug "$account - No previous backup. Incremental cancelled. Use -t for force full."
+			return 0
+		fi
+	else
+		passed_secs=$(( $(time_cur_tt) - $(time_cnv_date_time_mark_to_tt "$last_from") ))
+		query="query=after:-$(( passed_secs / 60 ))mi" 
+		local last_from_human
+		last_from_human=$(human_date_time --date="now - ${passed_secs}secs")
+		debug "$account - Last backup from $last_from_human ..."
+		backup_account "$account" "$mode" "$backup_to_file" "$query"
+		return 0
+	fi
+}
+
+#
+## Restore account
+restore_account()
+{
+	local account="$1"
+	local restore_start_time restore_end_time restore_files restore_size command_line status ret state_file
+	restore_start_time=$($DATE_cmd '+%F %T')
+	state_file=$($MKTEMP_cmd "${TMPDIR:-/tmp}/zmbkpose-restore-log.XXXXXX")
+
+	set +e
+	(
+		export RESTORE_LOG_FILES_STATE="$state_file"
+		set -e
+		restore_account_do "$@"
+	)
+	ret=$?
+	set -e
+
+	restore_files=$(<"$state_file")
+	$RM_cmd -f "$state_file" 2>/dev/null || true
+	restore_size=$(restore_log_files_size "$restore_files")
+	restore_end_time=$($DATE_cmd '+%F %T')
+	command_line=$(backup_log_command "${ZMBKPOSE_ORIGINAL_ARGS[@]}")
+	if [ "$ret" -eq 0 ];then status=OK; else status=ERROR; fi
+	restore_log_entry "$restore_start_time" "$account" "$restore_files" "$restore_size" "$restore_end_time" "$command_line" "$status"
+	return "$ret"
+}
+
+restore_account_do()
+{
+	local account="$1"
+	local date_time_mark_until="$2"
+	local restore_files="$3"
+	local last_backup
+	#Restore files
+	if [ -n "$restore_files" ];then
+		last_backup="${restore_files}"
+	else
+		restore_files=$(get_last_backup_cycle_prior_to "$account" "$date_time_mark_until")
+		if [ -z "$restore_files" ];then
+			local account_dir file_count fallback_restore_files fallback_count sample_files
+			account_dir=$(get_account_backup_dir "$account")
+			if [ -d "$account_dir" ];then
+				fallback_restore_files=$(get_valid_backup_archives_from_dir "$account_dir")
+				fallback_count=$(echo "$fallback_restore_files" | $SED_cmd '/^$/d' | $WC_cmd -l)
+				if [ "$fallback_count" -eq 1 ];then
+					restore_files="$fallback_restore_files"
+					debug "$account - Backup filename is not in zmbkpose date/type format. Falling back to the only valid backup archive in $account_dir"
+				else
+					file_count=$($FIND_cmd "$account_dir" -maxdepth 1 -mindepth 1 -type f | $WC_cmd -l)
+					sample_files=$($FIND_cmd "$account_dir" -maxdepth 1 -mindepth 1 -type f -printf '%f ' | $SED_cmd 's/ $//')
+					error "$account - No backup files available for restoration. Directory exists ($account_dir) with $file_count file(s), but no valid backup cycle was found. Valid zmbkpose archive candidates found: $fallback_count. Expected files like YYYYMMDDhhmmss:FULL.tar / YYYYMMDDhhmmss:INC.tar, or use --rf with the exact file. Files: $sample_files"
+					return 1
+				fi
+			else
+				error "$account - No backup files available for restoration. Expected backup directory: $account_dir"
+				return 1
+			fi
+		fi
+		last_backup=$(last_word "$restore_files")
+		debug "$account - Using ldap data from backup $last_backup"
+	fi
+	if [ -n "$RESTORE_LOG_FILES_STATE" ];then
+		printf '%s\n' "$restore_files" > "$RESTORE_LOG_FILES_STATE" 2>/dev/null || true
+	fi
+
+	#Ldap data from last backup
+	local ldap_data;ldap_data=$($TAR_cmd -O -xf "$last_backup" "$LDAP_FILE_IN_TAR"|ldap_unwrap_ldif)
+
+	#If you are restoring in another server, we will need to change
+	# some ldap atributtes if you want the account works
+	if [ -n "$TRY_DETECT_MailHostConf_on_restore" ];then
+		ldap_data=$(echo "$ldap_data"| ldif_auto_change_MailHostConf)
+	fi
+
+	#LDAP restore. Only add operation. 
+	#I think deletion is not secure implement. Modifications based on the 
+	# differences will be quite a challenge. I need you!
+	debug "$account - Ldap restore started"
+	while IFS= read -r dn;do
+		[ -z "$dn" ] && continue
+		if ! ldap_dn_exists "$dn" ;then 
+			debug "$account - Adding ldap entry: $dn"
+			[ -z "$SIMULATE" ] && \
+				echo "$ldap_data"|ldif_analysis_get_entry "$dn" |ldap_add 
+		fi
+	done<<-DNS
+		$(echo "$ldap_data" |ldif_analysis_get_att dn y)
+		DNS
+
+	#Account type
+	local ac_type;ac_type=$(echo "$ldap_data"| ldif_analysis_account_type)
+	[ "$ac_type" != ACCOUNT ] && \
+		debug "$account - No a mail account. Skipping mailbox restore." && return 0
+
+	#Mailbox restore
+	local mailhost
+	mailhost=$(echo "$ldap_data"| ldif_analysis_get_att zimbraMailHost)
+	[ -z "$mailhost" ] && error "$account - Can not get zimbraMailHost ldap att. from ldap backup" && return 1
+	debug "$account - Mailbox restore started"
+
+	while read tar_bkfile ;do [ -z "$tar_bkfile" ] && continue
+		#Debugg info
+		if [ "${tar_bkfile#$WORKDIR}" != "$tar_bkfile" ];then #file in WORKDIR
+			local backup_info date_time_mark full_inc
+			backup_info=$(echo "$tar_bkfile"| get_from_backup_file_name DATE_TIME_MARK FULL_INC)
+			if [ -n "$backup_info" ];then
+				read date_time_mark full_inc <<-BACKUP_INFO
+					$backup_info
+					BACKUP_INFO
+				if [ -n "$date_time_mark" -a -n "$full_inc" ];then
+					local human_date_time=$(time_cnv_date_time_mark_to_human $date_time_mark);
+					debug "$account - Restauring from $human_date_time $full_inc"
+				else
+					debug "$account - Restauring from \"$tar_bkfile\""
+				fi
+			else
+				debug "$account - Restauring from \"$tar_bkfile\""
+			fi
+		else
+			debug "$account - Restauring from \"$tar_bkfile\""
+		fi
+		#Restore
+		if ! $TAR_cmd -tf "$tar_bkfile" "$MAILBOX_FILE_IN_TAR" >/dev/null 2>&1;then
+			debug "file $MAILBOX_FILE_IN_TAR does not exists in tar file \"$tar_bkfile\".  Skipping mailbox restore"
+		elif [ -z "$SIMULATE" ] ;then
+			$TAR_cmd -O -xf "$tar_bkfile" "$MAILBOX_FILE_IN_TAR"| \
+				zimbra_mailbox_restore "$account" "$mailhost" 
+		fi
+	done<<-BACKUPS
+		$restore_files
+		BACKUPS
+
+	ok "$account - Restore end"
+}
+
+#
+## Delete old backups of account
+delete_old_backups_of_account()
+{
+	local account="$1"
+	local date_time_mark_until="$2"
+	
+	debug "$account - START deleting old backups cycles prior to" \
+		"$(time_cnv_date_time_mark_to_human $date_time_mark_until)"
+
+	if [ -z "$(get_backups_account "$account" FIRST)" ];then
+		debug "$account - Account does not have backups."
+		return 0
+	fi
+
+	while read date_time_mark full_inc bkfile ;do 
+		[ -z "$date_time_mark" ] && continue
+		human_date_time=$(time_cnv_date_time_mark_to_human $date_time_mark)
+		debug "$account - Deleting backup from $human_date_time $full_inc"
+		[ -z "$SIMULATE" ] && $RM_cmd -f "$bkfile"
+	done<<-BACKUP_LIST
+		$(get_backup_cycles_older_than "$account" "$date_time_mark_until"|\
+			get_from_backup_file_name DATE_TIME_MARK FULL_INC FULL_PATH )
+		BACKUP_LIST
+	ok "$account - END deleting old backups"
+}
+
+
+#
+## Delete old backup cycles by keeping a configured number of full cycles.
+function delete_old_backup_cycles_by_full_count(){
+	local account="$1"
+	local full_count_to_keep="$2"
+	local bkfile deleted
+	deleted=0
+
+	[ -z "$full_count_to_keep" ] && return 0
+	while IFS= read -r bkfile;do
+		[ -z "$bkfile" ] && continue
+		debug "$account - Rotating old backup file $bkfile"
+		[ -z "$SIMULATE" ] && $RM_cmd -f "$bkfile"
+		deleted=$(( deleted + 1 ))
+	done<<-ROTATE_BACKUPS
+		$(get_backup_cycles_exceeding_full_count "$account" "$full_count_to_keep")
+		ROTATE_BACKUPS
+
+	[ "$deleted" -eq 0 ] || ok "$account - Rotation deleted $deleted old backup file(s), keeping $full_count_to_keep existing full cycle(s)"
+	return 0
+}
+
+
+#
+## Before creating a new full backup, keep one fewer existing cycle so the new
+## full backup fits inside the configured final retention count.
+function rotate_before_full_backup(){
+	local account="$1"
+	local configured_keep="$2"
+	local existing_keep
+
+	[ -z "$configured_keep" ] && return 0
+	if [ "$configured_keep" -le 0 ];then
+		existing_keep=0
+	else
+		existing_keep=$(( configured_keep - 1 ))
+	fi
+	delete_old_backup_cycles_by_full_count "$account" "$existing_keep"
+}
+
+
+#
+## Return $INC_MARK or $FULL_MARK according to the need for a full 
+## or incremental backup.
+really_need_a_backup()
+{
+	local account="$1"
+	local do_full_without_full_from_sec="$2"
+	local do_inc_without_inc_from_sec="$3"
+
+
+	[ -z "$do_full_without_full_from_sec" -a -z "$do_inc_without_inc_from_sec" ] && \
+		return 1
+
+	local last_full_tm
+	last_full_tm=$(get_date_time_mark_last_full_backup "$account")
+
+	#We need a full backup?
+	if [ -n "$do_full_without_full_from_sec" ];then
+		#If we not have a previous full, we need it
+		[ -z "$last_full_tm" ] && debug "$account - No previous full backup. Doing.." && \
+			echo FULL_BACKUP && return 0
+		
+		local last_full_tt=$(time_cnv_date_time_mark_to_tt "$last_full_tm")
+		#If we have a very old full backup. We need a new copy
+		if [ $(( $(time_cur_tt) - $last_full_tt )) -ge $do_full_without_full_from_sec ];then
+			debug "$account - Last full backup too old. " \
+				"$( time_cnv_date_time_mark_to_human "$last_full_tm")"
+			echo FULL_BACKUP && return 0 
+		fi
+	fi
+
+	#We need a inc backup?
+	if [ -n "$do_inc_without_inc_from_sec" ];then
+		local last_inc_tm=$(get_date_time_mark_last_inc_backup "$account")
+		#If we not have a previous inc, we can consider the last full how a previous
+		[ -z "$last_inc_tm" -a -z "$last_full_tm" ] && \
+			debug "$account - There is not previous inc. or full backup for calculation." && \
+			debug "$account - Continuing with incremental backup." && \
+			echo INC_BACKUP && return 0
+		[ -z "$last_inc_tm" ] && last_inc_tm=$last_full_tm && \
+			debug "$account - No previous inc. backup. Calculating from last full $last_full_tm"
+		local last_inc_tt=$(time_cnv_date_time_mark_to_tt "$last_inc_tm")
+		#If we have a very old inc backup. We need a new copy
+		if [ $(( $(time_cur_tt) - $last_inc_tt )) -ge $do_inc_without_inc_from_sec ];then
+			debug "$account - Last inc. backup too old" \
+				"$( time_cnv_date_time_mark_to_human "$last_inc_tm")"
+			echo INC_BACKUP && return 0 
+		fi
+	fi
+	
+	[ -n "$last_full_tm" ] && \
+		debug "$account - Last full: $( time_cnv_date_time_mark_to_human "$last_full_tm")" 
+	[ -n "$last_inc_tm" ] && \
+		debug "$account - Last inc.: $( time_cnv_date_time_mark_to_human "$last_inc_tm")" 
+	debug "$account - Don't need a new backup."
+	return 1
+}
+
+
+################################################################################
+# OTHER functions ##############################################################
+
+#
+##Check if arg. is a number
+function is_a_number(){
+	echo "$1"|$EGREP_cmd -q '^[0-9]+$' && echo "$1"
+}
+
+#
+##Get last word in arguments
+function last_word(){
+	echo "$@" |$SED_cmd 's/ /\n/g'|$SED_cmd '/^$/d'|$SED_cmd -n '$p'
+}
+
+#
+##Error if no command
+function no_command_error(){
+	echo "ERROR:You don't have \"$1\" command, or it is not in your PATH" >&2
+}
+
+function resolve_cmd(){
+	local cmd_var="$1"
+	local cmd_name="$2"
+	local cmd_path="${!cmd_var}"
+
+	if [ -z "$cmd_path" ];then
+		cmd_path=$(command -v "$cmd_name") || { no_command_error "$cmd_name"; exit 1 ;}
+		printf -v "$cmd_var" '%s' "$cmd_path"
+	elif ! command -v "$cmd_path" >/dev/null 2>&1 ;then
+		no_command_error "$cmd_name"
+		exit 1
+	fi
+}
+
+###### MAIN ############
+#Trap INT, TERM signals, for close child process (util with parallel backups)
+trap "kill -s SIGTERM -- 0" SIGINT SIGTERM
+
+# Here the code loads the config file
+case "$1" in
+	-h|--help) show_help; exit 0 ;;
+esac
+
+if [ ! -r "$OSE_CONF/zmbkpose.conf" ];then
+	echo "ERROR:Cannot read config file \"$OSE_CONF/zmbkpose.conf\"" >&2
+	exit 1
+fi
+source "$OSE_CONF/zmbkpose.conf"
+ZMBKPOSE_ORIGINAL_ARGS=("$@")
+[ -z "$EXTRA_COMMAND_PATHS" ] && EXTRA_COMMAND_PATHS="/opt/zimbra/bin:/opt/zimbra/common/bin:/opt/zimbra/openldap/bin:/opt/zimbra/postfix/sbin"
+PATH="$EXTRA_COMMAND_PATHS:$PATH"
+export PATH
+[ -z "$VERIFY_BACKUP_AFTER_CREATE" ] && VERIFY_BACKUP_AFTER_CREATE=yes
+[ -z "$BACKUP_KEEP_FULL" ] && BACKUP_KEEP_FULL=0
+[ -z "$COLOR_MODE" ] && COLOR_MODE=auto
+[ -z "$QUIET_MODE" ] && QUIET_MODE=no
+if [ -n "$WORKDIR" -a "$WORKDIR" != "/" ];then
+	WORKDIR="${WORKDIR%/}"
+fi
+
+#Base Command dependencies 
+resolve_cmd AWK_cmd awk
+resolve_cmd DATE_cmd date
+resolve_cmd DIFF_cmd diff
+resolve_cmd DU_cmd du
+resolve_cmd EGREP_cmd egrep
+resolve_cmd FIND_cmd find
+resolve_cmd GREP_cmd grep
+resolve_cmd LN_cmd ln
+resolve_cmd MKTEMP_cmd mktemp
+resolve_cmd PRINTF_cmd printf
+resolve_cmd RM_cmd rm
+resolve_cmd SED_cmd sed
+resolve_cmd SORT_cmd sort
+resolve_cmd STAT_cmd stat
+resolve_cmd TAR_cmd tar
+resolve_cmd UNIQ_cmd uniq
+resolve_cmd WC_cmd wc
+resolve_cmd READLINK_cmd readlink
+
+case "$COLOR_MODE" in
+	(auto|always|never) true ;;
+	(*)
+		error "CONFIG: Incorrect COLOR_MODE \"$COLOR_MODE\". Use auto, always, or never."
+		exit 1
+	;;
+esac
+if ! normalized_backup_keep_full=$(is_a_number "$BACKUP_KEEP_FULL") || [ -z "$normalized_backup_keep_full" ];then
+	error "CONFIG: Incorrect BACKUP_KEEP_FULL \"$BACKUP_KEEP_FULL\". Use 0 or a positive number."
+	exit 1
+fi
+BACKUP_KEEP_FULL="$normalized_backup_keep_full"
+
+# Criticize the parameters passed on the command line
+while [ -n "$1" ];do
+	case "$1" in
+		(-a) #Accounts
+			[ -z "$2" ] && show_help && exit 
+			accounts=${2//,/ } #Multiple accounts comma separated
+			shift 2
+		;;
+		(--admuser) #Mailbox admin user
+			[ -z "$2" ] && show_help && exit 
+			ADMINUSER="$2" 
+			shift 2
+		;;
+		(--admpw) #Mailbox admin user password
+			[ -z "$2" ] && show_help && exit 
+			ADMINPASS="$2" 
+			shift 2
+		;;
+		(--bf) #Backup to a specific file(don't use WORKDIR)
+			[ -z "$2" ] && show_help && exit 
+			backup_to_file="$2"
+			if [ "$backup_to_file" != - -a -f "$backup_to_file" ] ;then
+				error "File: \"$backup_to_file\", already exists."
+				exit 1
+			fi
+			shift 2
+		;;
+		(--color) #Colored status output
+			[ -z "$2" ] && show_help && exit
+			case "$2" in
+				(auto|always|never) COLOR_MODE="$2" ;;
+				(*)
+					error "Incorrect color mode \"$2\". Use auto, always, or never."
+					show_help
+					exit 1
+				;;
+			esac
+			shift 2
+		;;
+
+		(-c) #For backups, operates only with a certain number of accounts. 
+			[ -z "$2" ] && show_help && exit 
+			if ! account_limit=$(is_a_number "$2") || [ -z "$account_limit" ] || [ "$account_limit" -le 0 ];then
+				error "Incorrect arg. especification for $1. See help."
+				show_help
+				exit 1
+			fi
+			shift 2
+		;;
+		(--chldaph) #In the restore, try changing some attributes of LDAP for account work.
+			TRY_DETECT_MailHostConf_on_restore=y 
+			shift 1
+		;;
+		(-C) #Similar to "-c", backups up to reach the time "time"
+			[ -z "$2" ] && show_help && exit 
+			if ! time_limit=$( cnv_time_expr_to_secs "$2" );then
+				error "Incorrect time especification for $1. See \"time FORMAT\" in help."
+				show_help
+				exit 1
+			fi
+			shift 2
+		;;
+		(-d) #Delete old backups
+			[ -z "$2" ] && show_help && exit 
+			action=DELETE_OLD_BACKUPS
+			if ! secs_to_retain=$( cnv_time_expr_to_secs "$2" );then
+				error "Incorrect time especification for $1. See \"time FORMAT\" in help."
+				show_help
+				exit 1
+			fi
+			shift 2
+			del_date_time_mark_until=$(time_cur_date_time_mark \
+				--date="-${secs_to_retain}secs")
+		;;
+		(--rotate-full-count) #Delete old backup cycles by full backup count
+			[ -z "$2" ] && show_help && exit
+			if ! full_count_to_keep=$(is_a_number "$2") || [ -z "$full_count_to_keep" ];then
+				error "Incorrect full backup count for $1. Use 0 or a positive number."
+				show_help
+				exit 1
+			fi
+			action=ROTATE_BACKUPS_BY_FULL_COUNT
+			shift 2
+		;;
+		(-e) #Wait a time between each backup of an account
+			[ -z "$2" ] && show_help && exit 
+			if ! time_btw_bks=$( cnv_time_expr_to_secs "$2" );then
+				error "Incorrect time especification for $1. See \"time FORMAT\" in help."
+				show_help
+				exit 1
+			fi
+			shift 2
+		;;
+		(-f) #Full account backup
+			action=FULL_BACKUP
+			shift 1
+		;;
+		(-F) #Do a full backup, only if the accounts don't have a full backup from "time"
+		   # or whithout a full backup.
+			[ -z "$2" ] && show_help && exit 
+			if ! do_full_without_full_from_secs=$( cnv_time_expr_to_secs "$2" );then
+				error "Incorrect time especification for $1. See \"time FORMAT\" in help."
+				show_help
+				exit 1
+			fi
+			action=COND_BACKUP
+			shift 2
+		;;
+		(-i) #Incremental account backup
+			action=INC_BACKUP
+			shift 1
+		;;
+		(-I) #Do a inc. backup, only if the accounts don't have a inc. or 
+		   #  full backup from "time".
+			[ -z "$2" ] && show_help && exit 
+			if ! do_inc_without_inc_from_secs=$( cnv_time_expr_to_secs "$2" );then
+				error "Incorrect time especification for $1. See \"time FORMAT\" in help."
+				show_help
+				exit 1
+			fi
+			action=COND_BACKUP
+			shift 2
+		;;
+		(-h|--help) #Show help
+			show_help
+			exit 0
+		;;
+		(-l|-m|-n) #List account backups info
+			case "$1" in
+				(-l) action=GET_BACKUPS_INFO;;
+				(-m) action=GET_FIRST_BACKUP_INFO;;
+				(-n) action=GET_LAST_BACKUP_INFO;;
+			esac
+			shift 1
+		;;
+		(--ldaph) #Ldap master server
+			[ -z "$2" ] && show_help && exit 
+			LDAPMASTERSERVER="ldap://$2" 
+			TRY_DETECT_MailHostConf_on_restore=y 
+			shift 2
+		;;
+		(--ldapdn) #Ldap zimbra admin user
+			[ -z "$2" ] && show_help && exit 
+			LDAPZIMBRADN="$2" 
+			shift 2
+		;;
+		(--ldappw) #Ldap zimbra admin password
+			[ -z "$2" ] && show_help && exit 
+			LDAPZIMBRAPASS="$2" 
+			shift 2
+		;;
+		(--no-verify) #Do not verify backup archive after creating it
+			VERIFY_BACKUP_AFTER_CREATE=no
+			shift 1
+		;;
+		(-p) #Backups in parallel, with a maximum of "n" instances
+			[ -z "$2" ] && show_help && exit 
+			PARALLEL_SUPPORT=1
+			if ! MAX_PARALLEL_PROCESS=$(is_a_number "$2") || [ -z "$MAX_PARALLEL_PROCESS" ] || [ "$MAX_PARALLEL_PROCESS" -le 0 ];then
+				error "Incorrect arg. especification for $1. See help."
+				show_help
+				exit 1
+			fi
+			shift 2
+		;;
+		(-q|--quiet) #Suppress status output
+			QUIET_MODE=yes
+			shift 1
+		;;
+		(-r) #Restore accounts from backups(last full + later incrementals)
+			action=RESTORE
+			shift 1
+		;;
+		(--rf) #Restore from a specific tar backup file
+			[ -z "$2" ] && show_help && exit 
+			restore_from_file="$2"
+			if [ ! -f "$restore_from_file" ] ;then
+				error "File: \"$restore_from_file\" does not exists."
+				exit 1
+			fi
+			if [ -n "$rest_date_time_mark_until" ];then
+				error "You cannot combine --rf and -R argument. You must use -r with --rf"
+				show_help
+				exit 1
+			fi
+			shift 2
+		;;
+
+		(-R) #Restore accounts up to the nearest backup before the ( now - 
+                   #   lapse_specified_time )
+		   # Time can be expresed in format $DATE_TIME_MARK_FORMAT or : 
+		   # n[mhdwM], where n is a number, "m" for minutes, "h" for hours, "d" 
+		   # for days, "w" for weeks, and "M" for months.
+			[ -z "$2" ] && show_help && exit 
+			if [ -n "$restore_from_file" ];then
+				error "You cannot combine --rf and -R argument. You must use -r with --rf"
+				show_help
+				exit 1
+			fi
+			if [ "$2" = - ] ;then
+				rest_date_time_mark_until=$2 #Rest. all backups starting with the oldest
+			elif restore_until_secs=$( cnv_time_expr_to_secs "$2" );then
+				rest_date_time_mark_until=$(time_cur_date_time_mark --date="-${restore_until_secs}secs")
+			elif ! rest_date_time_mark_until=$(is_date_time_mark "$2");then
+				error "Incorrect time especification for $1. See \"time FORMAT\" in help."
+				show_help
+				exit 1
+			fi
+			action=RESTORE
+			shift 2
+		;;
+		(-s) #Simulation of operations as if they really do
+			SIMULATE=yes
+			shift 1
+		;;
+		(-t) #Does full backup if there is no previous incremental
+			DO_FULL_IF_NO_PREV_INC=yes
+			shift 1
+		;;
+		(-u) #If error, continue with another account
+			CONT_ON_ERROR=1
+			shift 1
+		;;
+		(-v) #Verify backup archive files
+			action=VERIFY_BACKUPS
+			shift 1
+		;;
+		(--vf) #Verify a specific tar backup file
+			[ -z "$2" ] && show_help && exit 
+			verify_file="$2"
+			shift 2
+		;;
+		(--xtrace) #bash xtrace=> From man bash: After  expanding each simple 
+		           # command, for command, case command, select command, or
+                   # or arithmetic for command, display the expanded value of
+				   # PS4, followed by the command and its expanded arguments 
+				   # or associated word list.
+			debug "Enabling bash xtrace (set -x)..."
+			set -x 
+			shift 1
+		;;
+
+		(*) #Error
+			error "Incorrect parameters $1. See help."
+			show_help
+			exit 1
+		;;
+	esac
+done
+
+[ -n "$verify_file" -a -z "$action" ] && action=VERIFY_BACKUPS
+if [ -n "$verify_file" -a "$action" != VERIFY_BACKUPS ];then
+	error "You cannot combine --vf with actions other than -v"
+	show_help
+	exit 1
+fi
+
+#Extra Command dependencies
+case $action in
+	(FULL_BACKUP|INC_BACKUP|COND_BACKUP)
+		resolve_cmd CURL_cmd curl
+		resolve_cmd LDAPSEARCH_cmd ldapsearch
+		resolve_cmd GZIP_cmd gzip
+	;;
+	(RESTORE)
+		[ -n "$SIMULATE" ] || resolve_cmd CURL_cmd curl
+		[ -n "$SIMULATE" ] || resolve_cmd LDAPADD_cmd ldapadd
+		resolve_cmd LDAPSEARCH_cmd ldapsearch
+	;;
+	(VERIFY_BACKUPS)
+		resolve_cmd GZIP_cmd gzip
+	;;
+esac
+
+#Needed values depending on the action 
+case $action in
+	#Backup and restore
+    (FULL_BACKUP|INC_BACKUP|COND_BACKUP|RESTORE) 
+		if [ "$action" = RESTORE ];then
+			[ -z "$restore_from_file" -a -z "$WORKDIR" ] && \
+				error "CONFIG: You need to define WORKDIR. Or use --rf arg." && exit 1
+		else #Backup
+			[ -z "$backup_to_file" -a -z "$WORKDIR" ] && \
+				error "CONFIG: You need to define WORKDIR. Or use --bf arg." && exit 1
+		fi
+		[ -z "$ADMINUSER" ] && \
+			error "CONFIG: You need to define the variable ADMINUSER. Or use --admuser arg." && \
+			exit 1
+		[ -z "$ADMINPASS" ] && \
+			error "CONFIG: You need to define the variable ADMINPASS. Or use --admpw arg." && \
+			exit 1
+		[ -z "$LDAPMASTERSERVER" ] && \
+			error "CONFIG:You need to define the variable LDAPMASTERSERVER. Or use --ldaph arg." && \
+			exit 1
+		[ -z "$LDAPZIMBRADN" ] && \
+			error "You need to define the variable LDAPZIMBRADN. Or use --ldapdn arg." && \
+			exit 1
+		[ -z "$LDAPZIMBRAPASS" ] && \
+			error "You need to define the variable LDAPZIMBRAPASS. Or use --ldappw arg." && \
+			exit 1
+    ;;
+
+	#Get info, and delete backups
+	(GET_BACKUPS_INFO|GET_FIRST_BACKUP_INFO|GET_LAST_BACKUP_INFO|DELETE_OLD_BACKUPS|ROTATE_BACKUPS_BY_FULL_COUNT|VERIFY_BACKUPS) 
+		if [ "$action" != VERIFY_BACKUPS -o -z "$verify_file" ];then
+			[ -z "$WORKDIR" ] && \
+				error "CONFIG: You need to define WORKDIR." && exit 1
+		fi
+    ;;
+	(*) #Incorrect action, or not specified
+		if [ -n "$action" ];then error "Incorrect action. Try --help for help."
+		else error "You need specify an action. Try --help for help."
+		fi
+		exit 1
+    ;;
+esac
+
+#Check if destination dir exists
+case $action in
+	(FULL_BACKUP|INC_BACKUP|COND_BACKUP|GET_BACKUPS_INFO|GET_FIRST_BACKUP_INFO|GET_LAST_BACKUP_INFO|DELETE_OLD_BACKUPS|ROTATE_BACKUPS_BY_FULL_COUNT|VERIFY_BACKUPS)
+		[ -z "$backup_to_file" -a -z "$verify_file" -a ! -d "$WORKDIR" ] && error "$WORKDIR doesn't exists!" && exit 1
+	;;
+	(RESTORE)
+		[ -z "$restore_from_file" -a ! -d "$WORKDIR" ] && error "$WORKDIR doesn't exists!" && exit 1
+	;;
+esac
+
+#Do Action
+case $action in
+    (FULL_BACKUP|INC_BACKUP|COND_BACKUP) #Backups
+		#If not accounts passed, we use all accounts
+		[ -z "$accounts" ] && \
+			debug "Geting accounts in order of need backup." && \
+			accounts=$(get_accounts_in_order_of_need_backup)
+
+		#Is ldap server functional?
+		ldap_test_server	
+
+		debug "Analizing $(echo $accounts |$WC_cmd -w) accounts"
+		#For each account
+		init_tt=$(time_cur_tt) ; bk_count=0
+		for account in $accounts;do 
+			#Account exists?
+			[ -z "$(ldap_get_mailbox_atts "$account")" ] && \
+				debug "$account - account does not exists in zimbra. Skipping" && \
+				continue
+
+			#There are backup conditions?
+			if [ -n "$do_full_without_full_from_secs" -o \
+				 -n "$do_inc_without_inc_from_secs" ];then
+				if ! new_action=$(really_need_a_backup "$account" \
+						"$do_full_without_full_from_secs" \
+						"$do_inc_without_inc_from_secs");then
+					continue
+				fi
+				[ -n "$new_action" ] && action=$new_action
+			fi
+
+			#FULL or INC. backup?
+			if [ "$action" = FULL_BACKUP ];then
+				do_FUNCTION=backup_account ; mode=$FULL_MARK
+			elif [ "$action" = INC_BACKUP ];then
+				do_FUNCTION=backup_account_incremental ; mode=$INC_MARK
+			fi
+
+			#Secuencial, or parallel backup?
+			if [ "$PARALLEL_SUPPORT" = 1 ];then #Parallel 
+				until [ "$(jobs -r|$WC_cmd -l)" -lt "$MAX_PARALLEL_PROCESS" ]; do sleep 5 ; done
+				$do_FUNCTION "$account" "$mode" "$backup_to_file" &
+			else #Secuencial
+				#Trick for doing conditional the -e option
+				set +e ; ( set -e && $do_FUNCTION "$account" "$mode" "$backup_to_file") ; 
+				RET=$? ;  set -e
+				[ "$RET" -eq 0 -o -n "$CONT_ON_ERROR" ]
+			fi
+
+			let bk_count++ || true ; 
+
+			#Time limit?
+			if [ -n "$time_limit" ] && \
+			  [ $(( $(time_cur_tt) - $init_tt )) -ge "$time_limit" ];then 
+				debug "time limit reached (-C ${time_limit}s). $bk_count backups performed"
+				break 
+			fi
+
+			#Account numbers limit?
+			if [ -n "$account_limit" ] && [ "$bk_count" -eq "$account_limit" ];then 
+				debug "accounts limit reached (-c $account_limit). $bk_count backups performed"
+				break 
+			fi
+
+			#Wait between backups?
+			[ -n "$time_btw_bks" ] && \
+				debug "Waiting $time_btw_bks secs..." && sleep $time_btw_bks
+		done
+		wait #Waiting for background processes
+		ok "Backup FINISHED $bk_count backups performed"
+    ;;
+
+	(GET_BACKUPS_INFO|GET_FIRST_BACKUP_INFO|GET_LAST_BACKUP_INFO) #Get info from backups 
+
+		#Specific information backup
+		position=any
+		case $action in 
+			(GET_FIRST_BACKUP_INFO) position=FIRST;;
+		 	(GET_LAST_BACKUP_INFO)  position=LAST;;
+		esac
+		#If not accounts passed, we use all accounts
+		[ -z "$accounts" ] && accounts=$(get_accounts_in_backups)
+
+		get_account_backups_info $position $accounts
+    ;;
+
+	(VERIFY_BACKUPS) #Verify backup archive files
+		if [ -n "$verify_file" ];then
+			verify_backup_file "$verify_file"
+		else
+			#If not accounts passed, we use all accounts found in backup storage
+			[ -z "$accounts" ] && accounts=$(get_accounts_in_backups)
+			verify_account_backups $accounts
+		fi
+    ;;
+
+	(RESTORE) #Restore accounts from backups
+		#If not accounts passed, restore accounts found in backup storage.
+		restore_account_source="command line"
+		restore_order_msg=""
+		if [ -z "$accounts" ];then
+			if [ -n "$restore_from_file" ];then
+				accounts=$(get_account_from_backup_file "$restore_from_file") || {
+					error "RESTORE: Cannot detect account address from \"$restore_from_file\". Use -a account@example.com with --rf."
+					exit 1
+				}
+				restore_account_source="--rf \"$restore_from_file\""
+			else
+				debug "Getting accounts from backup storage for restore."
+				accounts=$(get_accounts_in_backups)
+				restore_account_source="WORKDIR=\"$WORKDIR\""
+				restore_order_msg=" in domain/user A-Z order"
+			fi
+		fi
+		[ -z "$accounts" ] && \
+			error "RESTORE: No accounts found to restore. Check WORKDIR=\"$WORKDIR\" and the backup directory layout domain/user/YYYYMMDDhhmmss:FULL.tar." && exit 1
+	
+		[ -z "$rest_date_time_mark_until" -a -z "$restore_from_file" ] && \
+			rest_date_time_mark_until=99991231235959 
+ 
+		#Is ldap server functional?
+		ldap_test_server	
+
+		restore_total=$(echo "$accounts" | $WC_cmd -w | $AWK_cmd '{print $1}')
+		restore_count=0
+		restore_failed=0
+		ok "RESTORE: $restore_total account(s) queued from $restore_account_source$restore_order_msg."
+		for account in $accounts;do
+			let restore_count++ || true
+			ok "RESTORE: [$restore_count/$restore_total] $account"
+			set +e ; ( set -e && restore_account "$account" "$rest_date_time_mark_until" "$restore_from_file" )
+			RET=$? ; set -e
+			if [ "$RET" -ne 0 ];then
+				let restore_failed++ || true
+				error "RESTORE: [$restore_count/$restore_total] $account failed."
+				[ -n "$CONT_ON_ERROR" ] || exit "$RET"
+			fi
+		done
+		if [ "$restore_failed" -eq 0 ];then
+			ok "RESTORE FINISHED: $restore_count account(s) completed."
+		else
+			error "RESTORE FINISHED: $restore_count account(s) processed, $restore_failed failed."
+			exit 1
+		fi
+    ;;
+
+	(DELETE_OLD_BACKUPS) #Delete old backups
+		#If not accounts passed, we use all accounts
+		[ -z "$accounts" ] && accounts=$(get_accounts_in_backups)
+
+		for account in $accounts;do
+			delete_old_backups_of_account "$account" "$del_date_time_mark_until"
+		done
+	;;
+
+	(ROTATE_BACKUPS_BY_FULL_COUNT) #Delete old backup cycles by keeping newest full count
+		[ -z "$accounts" ] && accounts=$(get_accounts_in_backups)
+
+		for account in $accounts;do
+			delete_old_backup_cycles_by_full_count "$account" "$full_count_to_keep"
+		done
+    ;;
+
+	(*) #action needed
+		error "You must specify an action"
+		show_help
+		exit 1
+	;;
+esac

@@ -1,0 +1,64 @@
+zmbkpose (2.0.rewrite.proposal)
+	* This is a complete rewrite proposal to zmbkpose. main features:
+	  Full rewrite of source code 
+	  Elimination of session log metadata
+	  New storage format for backups, incomppatible with older versions
+	  Conditional incremental or full backup(how old is the last backup)
+	  Restore the account to a specific time
+-- Leandro Santinelli <liandrosg@gmail.com> Fri, 07 09 2012 15:28:39 -0300
+
+zmbkpose (2.0)
+	* Added functions:  
+	backup_distribution_list()
+	restore_distribution_list()
+	backup_alias()
+	restore_alias()
+	backup_accounts_parallel()  (backup specific accounts parallel)
+
+	* Modified functions: 
+	backup_all_accounts_parallel()  (added backup trash and junk folders)
+	incremental_all_accounts()  (doesnt create another full directory if new accounts are created after the last full backup)
+
+	* Renamed functions: 
+	DeusMeAjude -> restore_all_accounts()  (Restore all accounts parallel)
+
+	* Bug corrections:  
+	Wrong variables names references after translate to english.
+
+-- William Felipe Welter <william.welter@4linux.com.br> Mon, 18 06 2012 00:00:00 -0300
+
+
+zmbkpose (0.5)
+	* Add a simple install script
+	* Add a simple INSTALL note
+
+zmbkpose (0.4)
+	* Add the original source code
+	* Add the original conf file
+	* Add COPYING
+
+-- Bruno Gurgel <bruno.gurgel@gmail.com> Mon, 25 07 2010 09:35:44 -0300
+
+
+zmbkpose (0.3)
+	* Fix changelog TRYING to follow RFC 2822 and RFC 5322
+	* Publishing on github
+	* Re-Write README
+
+-- Bruno Gurgel <bruno.gurgel@gmail.com> Thu, 21 07 2010 23:37:33 -0300
+
+zmbkpose (0.2)
+	* addedd backup_todas_contas_parallel()
+	* PARALLEL_SUPPORT and MAX_PARALLEL_PROCESS to conffile
+
+-- Bruno Gurgel <bruno.gurgel@gmail.com>
+-- Alan Milani <niki.milani@gmail.com> Tue, 26 10 2010 17:35:14 -0300
+
+
+zmbkpose (0.1) 
+	* Origial version created
+
+-- Rubens Alonso <rubens@harv.com.br> Tue, 15 12 2009 13:55:04 -0300
+
+
+

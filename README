@@ -1,0 +1,559 @@
+# Zmbkpose v3
+
+`zmbkposev3` is a Bash tool for hot backup and restore of Zimbra Collaboration
+Open Source Edition accounts.
+
+It backs up:
+
+- account LDAP data to `acct.ldif`
+- mailbox data to `mailbox.tgz`
+- full and incremental backup cycles
+
+It installs as `zmbkposev3`, not `zmbkpose`, so it can live beside an existing
+legacy zmbkpose installation.
+
+## Important Scope
+
+This tool is for account-level backup and restore. It is not full disaster
+recovery for a Zimbra server.
+
+It does not replace VM snapshots, storage snapshots, OS backup, Zimbra server
+configuration backup, SSL certificate backup, DNS backup, or a documented
+bare-metal recovery plan.
+
+## Features
+
+- Full backup for all accounts or selected accounts
+- Incremental backup based on the previous backup time
+- Restore existing or deleted accounts
+- Restore all accounts found in backup storage
+- Backup archive verification
+- CSV backup and restore audit logs
+- init.d scheduler service
+- Scheduled full and incremental backup times
+- Retry handling for failed scheduled backups
+- Backup retention before full backups start
+- Optional remote copy by `rsync` or `sftp`
+- Optional SFTP SSH key generation during install
+- Safe uninstaller
+
+## Requirements
+
+Tested for Ubuntu-style Linux servers. The scripts expect Bash and common Unix
+tools.
+
+Required commands:
+
+```bash
+awk curl date diff du egrep find grep gzip ldapadd ldapsearch ln mktemp printf rm sed sort stat tar uniq readlink
+```
+
+Optional commands:
+
+```bash
+rsync       # only when REMOTE_COPY_METHOD=rsync
+sftp        # only when REMOTE_COPY_METHOD=sftp
+ssh-keygen  # only when installer generates an SFTP key
+```
+
+On some Zimbra installs, `ldapsearch` is under Zimbra paths instead of the
+system path. `EXTRA_COMMAND_PATHS` handles that.
+
+## Install
+
+Run the installer as root:
+
+```bash
+chmod +x install.sh
+sudo ./install.sh
+```
+
+The installer copies:
+
+```text
+/usr/local/bin/zmbkposev3
+/usr/local/bin/zmbkposev3-main
+/usr/local/bin/zmbkposev3-uninstall
+/etc/init.d/zmbkposev3
+/etc/zmbkposev3/zmbkpose.conf
+```
+
+During install it asks for:
+
+- backup working directory
+- service user, normally `zimbra`
+- full backup time
+- incremental backup times
+- how many full backup cycles to keep
+- retry count and retry wait time
+- optional remote copy method, `rsync` or `sftp`
+- optional SFTP key generation
+
+## Configuration
+
+Main config file:
+
+```bash
+/etc/zmbkposev3/zmbkpose.conf
+```
+
+Minimal example:
+
+```bash
+WORKDIR="/opt/mailbackup-files"
+ADMINUSER="admin@example.com"
+ADMINPASS="change-this"
+LDAPMASTERSERVER="ldap://mail.example.com:389"
+LDAPZIMBRADN="uid=zimbra,cn=admins,cn=zimbra"
+LDAPZIMBRAPASS="change-this"
+VERIFY_BACKUP_AFTER_CREATE=yes
+```
+
+Zimbra LDAP values can usually be found on the Zimbra server:
+
+```bash
+su - zimbra -c 'zmlocalconfig zimbra_ldap_userdn'
+su - zimbra -c 'zmlocalconfig -s zimbra_ldap_password'
+```
+
+Do not commit a real production `zmbkpose.conf` with passwords.
+
+## Backup Storage
+
+Backups are stored under `WORKDIR` using this layout:
+
+```text
+WORKDIR/domain/user/YYYYMMDDhhmmss:FULL.tar
+WORKDIR/domain/user/YYYYMMDDhhmmss:INC.tar
+```
+
+Example:
+
+```text
+/opt/mailbackup-files/example.com/alice/20260904120000:FULL.tar
+/opt/mailbackup-files/example.com/alice/20260904180000:INC.tar
+```
+
+Each backup tar contains:
+
+```text
+acct.ldif     LDAP account data
+mailbox.tgz   mailbox export from Zimbra
+```
+
+Distribution lists and non-mailbox entries may contain only LDAP data.
+
+## Manual Backup
+
+Full backup for all accounts:
+
+```bash
+sudo -u zimbra zmbkposev3 -f
+```
+
+Full backup for one account:
+
+```bash
+sudo -u zimbra zmbkposev3 -f -a alice@example.com
+```
+
+Full backup for multiple accounts:
+
+```bash
+sudo -u zimbra zmbkposev3 -f -a alice@example.com,bob@example.com
+```
+
+Incremental backup:
+
+```bash
+sudo -u zimbra zmbkposev3 -i -a alice@example.com
+```
+
+Incremental backup, but create a full backup if no previous backup exists:
+
+```bash
+sudo -u zimbra zmbkposev3 -i -t -a alice@example.com
+```
+
+Conditional full backup, only when the last full backup is older than 7 days:
+
+```bash
+sudo -u zimbra zmbkposev3 -F 7d
+```
+
+Conditional incremental backup, only when the last backup is older than 4 hours:
+
+```bash
+sudo -u zimbra zmbkposev3 -I 4h -t
+```
+
+Useful limits:
+
+```bash
+sudo -u zimbra zmbkposev3 -f -C 6h -c 400 -e 5s
+```
+
+Meaning:
+
+- `-C 6h` stops starting new account backups after 6 hours
+- `-c 400` limits this run to 400 accounts
+- `-e 5s` waits 5 seconds between accounts
+
+## Backup Verification
+
+By default, new backup files are verified before the `LAST` symlink is updated.
+
+Verification checks:
+
+- outer tar readability
+- `acct.ldif` exists and has valid Zimbra LDAP data
+- mailbox accounts contain a readable `mailbox.tgz`
+
+Verify all backups:
+
+```bash
+sudo -u zimbra zmbkposev3 -v
+```
+
+Verify one account:
+
+```bash
+sudo -u zimbra zmbkposev3 -v -a alice@example.com
+```
+
+Verify one file:
+
+```bash
+sudo -u zimbra zmbkposev3 --vf /opt/mailbackup-files/example.com/alice/20260904120000:FULL.tar
+```
+
+Skip verification for one backup run:
+
+```bash
+sudo -u zimbra zmbkposev3 -f --no-verify
+```
+
+## Retention
+
+`BACKUP_KEEP_FULL` controls how many full backup cycles are kept per account.
+The check runs before a new full backup starts, which saves disk space.
+
+Examples:
+
+```bash
+BACKUP_KEEP_FULL=3
+```
+
+Before a new full backup, old cycles are deleted until only two existing full
+cycles remain. After the new full backup completes, the account has three full
+cycles.
+
+```bash
+BACKUP_KEEP_FULL=0
+```
+
+All existing valid backup cycles for that account are deleted before the new
+full backup is created. The new full backup still gets created.
+
+Be careful with `BACKUP_KEEP_FULL=0`: if old cycles are deleted and the new full
+backup fails, there may be no previous backup cycle left for that account.
+
+Manual count-based rotation:
+
+```bash
+sudo -u zimbra zmbkposev3 --rotate-full-count 3
+sudo -u zimbra zmbkposev3 --rotate-full-count 0 -a alice@example.com
+```
+
+Delete backups older than a time expression while keeping restore consistency:
+
+```bash
+sudo -u zimbra zmbkposev3 -d 30d
+```
+
+## Restore
+
+Restore one account from the latest full cycle and later incrementals:
+
+```bash
+sudo -u zimbra zmbkposev3 -r -a alice@example.com
+```
+
+Restore all accounts found in `WORKDIR`:
+
+```bash
+sudo -u zimbra zmbkposev3 -r
+```
+
+When `-a` is not specified, accounts are restored from backup storage in
+domain/user A-Z order.
+
+Restore from a specific file:
+
+```bash
+sudo -u zimbra zmbkposev3 -r --rf /path/to/20260904120000:FULL.tar
+```
+
+Restore up to a point in time:
+
+```bash
+sudo -u zimbra zmbkposev3 -R 20260904180000 -a alice@example.com
+```
+
+Restore behavior:
+
+- if the account exists, missing messages are restored into it
+- if the account does not exist, LDAP data is used to create it
+- LDAP entries that already exist are not merged
+- use `-u` to continue with the next account after a restore failure
+
+## Scheduler Service
+
+Start, stop, restart, and check status:
+
+```bash
+sudo /etc/init.d/zmbkposev3 start
+sudo /etc/init.d/zmbkposev3 stop
+sudo /etc/init.d/zmbkposev3 restart
+sudo /etc/init.d/zmbkposev3 status
+```
+
+Enable at boot on Debian/Ubuntu:
+
+```bash
+sudo update-rc.d zmbkposev3 defaults
+```
+
+Scheduler settings:
+
+```bash
+SCHEDULER_ENABLED=yes
+FULL_BACKUP_TIME=00:00
+INCREMENTAL_BACKUP_TIMES="06:00 09:00 18:00 21:00"
+FULL_BACKUP_ARGS="-f"
+INCREMENTAL_BACKUP_ARGS="-i -t"
+BACKUP_RETRY_COUNT=3
+BACKUP_RETRY_WAIT_SECONDS=300
+```
+
+Config changes are loaded on service restart:
+
+```bash
+sudo /etc/init.d/zmbkposev3 restart
+```
+
+The service checks Zimbra before start/restart:
+
+```bash
+CHECK_ZIMBRA_ON_SERVICE_START=yes
+ZIMBRA_CONTROL=/opt/zimbra/bin/zmcontrol
+```
+
+If this scheduler is installed on a non-Zimbra backup host, set:
+
+```bash
+CHECK_ZIMBRA_ON_SERVICE_START=no
+```
+
+Scheduler markers are stored in `SCHEDULER_STATE_DIR`:
+
+- `.running` while a scheduled job is active
+- `.done` only after success
+- `.failed` after failure
+
+Failed scheduled jobs retry according to `BACKUP_RETRY_COUNT` and
+`BACKUP_RETRY_WAIT_SECONDS`.
+
+## Remote Copy
+
+Remote copy runs after a successful scheduled backup.
+
+Choose the method:
+
+```bash
+REMOTE_COPY_ENABLED=yes
+REMOTE_COPY_METHOD=rsync
+```
+
+or:
+
+```bash
+REMOTE_COPY_ENABLED=yes
+REMOTE_COPY_METHOD=sftp
+```
+
+Remote copy failures are logged, but they do not delete local backup files.
+
+### Rsync
+
+Example:
+
+```bash
+REMOTE_COPY_ENABLED=yes
+REMOTE_COPY_METHOD=rsync
+RSYNC_TARGET=backupuser@192.0.2.10:/backup/mailbackup-files/
+RSYNC_OPTIONS="-a --partial --delay-updates"
+RSYNC_DELETE=no
+RSYNC_SSH_PORT=22
+RSYNC_BWLIMIT=
+```
+
+`RSYNC_DELETE=yes` adds `--delete-after`. Use it carefully because it can delete
+remote files that no longer exist locally.
+
+### SFTP
+
+Example:
+
+```bash
+REMOTE_COPY_ENABLED=yes
+REMOTE_COPY_METHOD=sftp
+SFTP_TARGET=backupuser@192.0.2.10:/backup/mailbackup-files/
+SFTP_PORT=22
+SFTP_IDENTITY_FILE=/opt/zimbra/.ssh/zmbkposev3_sftp
+SFTP_OPTIONS="-oBatchMode=yes -oStrictHostKeyChecking=accept-new"
+```
+
+The username is in `SFTP_TARGET`. Passwords are not stored in the config.
+
+For SFTP, use SSH key or passwordless login. During install, the script can
+generate an SSH key for the service user. The private key stays on the mail
+server. Copy the `.pub` key to the SFTP server user's authorized keys.
+
+TrueNAS/FreeNAS example flow:
+
+1. Create a dataset or folder for backups.
+2. Create an SFTP user, for example `backupuser`.
+3. Give that user write permission to the backup dataset or folder.
+4. Enable/start the SSH service.
+5. Paste the generated public key into that user's SSH Authorized Keys field.
+6. Test login from the mail server:
+
+```bash
+sudo -u zimbra sftp -i /opt/zimbra/.ssh/zmbkposev3_sftp -P 22 backupuser@192.0.2.10
+```
+
+## Logging
+
+The installer creates:
+
+```text
+/var/log/zmbkpose
+```
+
+Log files:
+
+```text
+/var/log/zmbkpose/zmbkpose-installation.log
+/var/log/zmbkpose/zmbkpose-main.log
+/var/log/zmbkpose/zmbkpose-backup.log
+/var/log/zmbkpose/zmbkpose-restore.log
+```
+
+Backup CSV fields:
+
+```text
+start_time,email,backup_location,backup_size,end_time,zmbkpose_command
+```
+
+Restore CSV fields:
+
+```text
+start_time,email,backup_location,backup_size,end_time,zmbkpose_command,status
+```
+
+Passwords passed with `--admpw` or `--ldappw` are hidden in logged command
+lines.
+
+## Failure Behavior
+
+If an account backup fails:
+
+- the incomplete backup tar is removed
+- `LAST` is not updated
+- no successful backup CSV line is written for that account
+- scheduled remote copy does not run for that failed backup job
+
+If a scheduled backup fails:
+
+- the scheduler writes a `.failed` marker
+- it retries based on `BACKUP_RETRY_COUNT`
+- it writes `.done` only after success
+- the scheduler service keeps running
+
+If SFTP or rsync remote copy fails:
+
+- the error is logged in `zmbkpose-main.log`
+- local backup files remain untouched
+
+## Troubleshooting
+
+`ERROR: You don't have "ldapsearch" command, or it is not in your PATH`
+
+Set or check:
+
+```bash
+EXTRA_COMMAND_PATHS="/opt/zimbra/bin:/opt/zimbra/common/bin:/opt/zimbra/openldap/bin:/opt/zimbra/postfix/sbin"
+```
+
+Then restart the service:
+
+```bash
+sudo /etc/init.d/zmbkposev3 restart
+```
+
+`VERIFY: "...FULL.tar" contains an invalid mailbox.tgz`
+
+The mailbox export returned something that is not a valid tar-gzip mailbox
+archive. Common causes:
+
+- wrong admin username or password
+- Zimbra mailbox service is not running
+- mailbox export URL failed
+- proxy or certificate problem
+- account/mailhost mismatch
+
+Try a manual backup for one account and inspect the log:
+
+```bash
+sudo -u zimbra zmbkposev3 -f -a alice@example.com
+tail -100 /var/log/zmbkpose/zmbkpose-main.log
+```
+
+Service starts, but new config is not applied
+
+Restart is required after config changes:
+
+```bash
+sudo /etc/init.d/zmbkposev3 restart
+```
+
+## Uninstall
+
+Remove service and program files:
+
+```bash
+sudo zmbkposev3-uninstall
+```
+
+Remove service, program files, config, logs, state files, and configured SFTP
+key:
+
+```bash
+sudo zmbkposev3-uninstall --purge-all
+```
+
+Backup files in `WORKDIR` are never removed by the uninstaller.
+
+## Security Notes
+
+- Do not commit real `zmbkpose.conf` files containing passwords.
+- Keep `/etc/zmbkposev3/zmbkpose.conf` readable only by trusted users.
+- Keep SFTP private keys on the mail server only.
+- Copy only `.pub` keys to remote backup servers.
+- Protect backup storage because mailbox archives contain user mail.
+
+## License
+
+This project is distributed under the GNU General Public License. See
+`COPYING` for details.

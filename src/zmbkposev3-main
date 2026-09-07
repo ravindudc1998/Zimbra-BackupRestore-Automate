@@ -1,0 +1,414 @@
+#!/bin/bash
+# zmbkposev3 scheduled backup daemon
+
+OSE_CONF="/etc/zmbkposev3"
+OSE_BIN="/usr/local/bin/zmbkposev3"
+LOG_DIR="/var/log/zmbkpose"
+MAIN_LOG_FILE="$LOG_DIR/zmbkpose-main.log"
+STATE_DIR="/var/lib/zmbkpose"
+EXTRA_COMMAND_PATHS="/opt/zimbra/bin:/opt/zimbra/common/bin:/opt/zimbra/openldap/bin:/opt/zimbra/postfix/sbin"
+
+function load_config(){
+	if [ ! -r "$OSE_CONF/zmbkpose.conf" ];then
+		echo "$(date '+%F %T') ERROR: Cannot read config file $OSE_CONF/zmbkpose.conf" >&2
+		exit 1
+	fi
+	source "$OSE_CONF/zmbkpose.conf"
+	[ -z "$EXTRA_COMMAND_PATHS" ] && EXTRA_COMMAND_PATHS="/opt/zimbra/bin:/opt/zimbra/common/bin:/opt/zimbra/openldap/bin:/opt/zimbra/postfix/sbin"
+	PATH="$EXTRA_COMMAND_PATHS:$PATH"
+	export PATH
+	[ -z "$SERVICE_USER" ] && SERVICE_USER=zimbra
+	[ -z "$SCHEDULER_ENABLED" ] && SCHEDULER_ENABLED=yes
+	[ -z "$FULL_BACKUP_TIME" ] && FULL_BACKUP_TIME=00:00
+	[ -z "$INCREMENTAL_BACKUP_TIMES" ] && INCREMENTAL_BACKUP_TIMES="06:00 09:00 18:00 21:00"
+	[ -z "$FULL_BACKUP_ARGS" ] && FULL_BACKUP_ARGS="-f"
+	[ -z "$INCREMENTAL_BACKUP_ARGS" ] && INCREMENTAL_BACKUP_ARGS="-i -t"
+	[ -z "$BACKUP_RETRY_COUNT" ] && BACKUP_RETRY_COUNT=3
+	[ -z "$BACKUP_RETRY_WAIT_SECONDS" ] && BACKUP_RETRY_WAIT_SECONDS=300
+	[ -z "$SCHEDULER_SLEEP_SECONDS" ] && SCHEDULER_SLEEP_SECONDS=30
+	[ -z "$SCHEDULER_STATE_DIR" ] && SCHEDULER_STATE_DIR="$STATE_DIR"
+	[ -z "$MAIN_LOG_FILE" ] && MAIN_LOG_FILE="$LOG_DIR/zmbkpose-main.log"
+	[ -z "$BACKUP_KEEP_FULL" ] && BACKUP_KEEP_FULL=0
+	[ -z "$RSYNC_ENABLED" ] && RSYNC_ENABLED=no
+	[ -z "$REMOTE_COPY_ENABLED" ] && REMOTE_COPY_ENABLED="$RSYNC_ENABLED"
+	[ -z "$REMOTE_COPY_ENABLED" ] && REMOTE_COPY_ENABLED=no
+	[ -z "$REMOTE_COPY_METHOD" ] && REMOTE_COPY_METHOD=rsync
+	[ -z "$RSYNC_OPTIONS" ] && RSYNC_OPTIONS="-a --partial --delay-updates"
+	[ -z "$RSYNC_DELETE" ] && RSYNC_DELETE=no
+	[ -z "$SFTP_PORT" ] && SFTP_PORT=22
+	[ -z "$SFTP_OPTIONS" ] && SFTP_OPTIONS="-oBatchMode=yes -oStrictHostKeyChecking=accept-new"
+}
+
+function setup_logging(){
+	local main_log_dir
+	main_log_dir="${MAIN_LOG_FILE%/*}"
+	mkdir -p "$main_log_dir" "$SCHEDULER_STATE_DIR"
+	touch "$MAIN_LOG_FILE"
+	exec >> "$MAIN_LOG_FILE" 2>&1
+}
+
+function main_log(){
+	local level="$1"
+	shift
+	printf '%s %s: %s\n' "$(date '+%F %T')" "$level" "$*"
+}
+
+function valid_time(){
+	[[ "$1" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]]
+}
+
+function normalize_time_list(){
+	local time_value
+	for time_value in ${1//,/ };do
+		[ -z "$time_value" ] && continue
+		printf '%s\n' "$time_value"
+	done
+}
+
+function validate_config(){
+	local time_value
+	case "$SCHEDULER_ENABLED" in
+		yes|no) true ;;
+		*) main_log ERROR "SCHEDULER_ENABLED must be yes or no"; return 1 ;;
+	esac
+	case "$RSYNC_ENABLED" in
+		yes|no) true ;;
+		*) main_log ERROR "RSYNC_ENABLED must be yes or no"; return 1 ;;
+	esac
+	case "$REMOTE_COPY_ENABLED" in
+		yes|no) true ;;
+		*) main_log ERROR "REMOTE_COPY_ENABLED must be yes or no"; return 1 ;;
+	esac
+	case "$REMOTE_COPY_METHOD" in
+		rsync|sftp) true ;;
+		*) main_log ERROR "REMOTE_COPY_METHOD must be rsync or sftp"; return 1 ;;
+	esac
+	case "$RSYNC_DELETE" in
+		yes|no) true ;;
+		*) main_log ERROR "RSYNC_DELETE must be yes or no"; return 1 ;;
+	esac
+	if ! valid_time "$FULL_BACKUP_TIME";then
+		main_log ERROR "FULL_BACKUP_TIME must be HH:MM, got $FULL_BACKUP_TIME"
+		return 1
+	fi
+	for time_value in $(normalize_time_list "$INCREMENTAL_BACKUP_TIMES");do
+		if ! valid_time "$time_value";then
+			main_log ERROR "INCREMENTAL_BACKUP_TIMES contains invalid time $time_value"
+			return 1
+		fi
+	done
+	if ! [[ "$SCHEDULER_SLEEP_SECONDS" =~ ^[0-9]+$ ]] || [ "$SCHEDULER_SLEEP_SECONDS" -le 0 ];then
+		main_log ERROR "SCHEDULER_SLEEP_SECONDS must be a positive number"
+		return 1
+	fi
+	if ! [[ "$BACKUP_KEEP_FULL" =~ ^[0-9]+$ ]];then
+		main_log ERROR "BACKUP_KEEP_FULL must be 0 or a positive number"
+		return 1
+	fi
+	if ! [[ "$BACKUP_RETRY_COUNT" =~ ^[0-9]+$ ]];then
+		main_log ERROR "BACKUP_RETRY_COUNT must be 0 or a positive number"
+		return 1
+	fi
+	if ! [[ "$BACKUP_RETRY_WAIT_SECONDS" =~ ^[0-9]+$ ]];then
+		main_log ERROR "BACKUP_RETRY_WAIT_SECONDS must be 0 or a positive number"
+		return 1
+	fi
+	if [ -n "$RSYNC_BWLIMIT" ] && ! [[ "$RSYNC_BWLIMIT" =~ ^[0-9]+$ ]];then
+		main_log ERROR "RSYNC_BWLIMIT must be blank or a number"
+		return 1
+	fi
+	if [ -n "$RSYNC_SSH_PORT" ] && ! [[ "$RSYNC_SSH_PORT" =~ ^[0-9]+$ ]];then
+		main_log ERROR "RSYNC_SSH_PORT must be blank or a number"
+		return 1
+	fi
+	if [ "$REMOTE_COPY_ENABLED" = yes -a "$REMOTE_COPY_METHOD" = rsync -a -z "$RSYNC_TARGET" ];then
+		main_log ERROR "RSYNC_TARGET is required when REMOTE_COPY_METHOD=rsync"
+		return 1
+	fi
+	if [ -n "$SFTP_PORT" ] && ! [[ "$SFTP_PORT" =~ ^[0-9]+$ ]];then
+		main_log ERROR "SFTP_PORT must be blank or a number"
+		return 1
+	fi
+	if [ "$REMOTE_COPY_ENABLED" = yes -a "$REMOTE_COPY_METHOD" = sftp ];then
+		if [ -z "$SFTP_TARGET" ];then
+			main_log ERROR "SFTP_TARGET is required when REMOTE_COPY_METHOD=sftp"
+			return 1
+		fi
+		if [[ "$SFTP_TARGET" != *:* ]];then
+			main_log ERROR "SFTP_TARGET must look like user@host:/remote/path"
+			return 1
+		fi
+	fi
+}
+
+function sftp_quote(){
+	local value="$1"
+	value="${value//\\/\\\\}"
+	value="${value//\"/\\\"}"
+	printf '"%s"' "$value"
+}
+
+function write_sftp_mkdirs(){
+	local remote_path="$1"
+	local path_parts segment current old_ifs
+
+	remote_path="${remote_path%/}"
+	[ -z "$remote_path" -o "$remote_path" = "." -o "$remote_path" = "/" ] && return 0
+	if [[ "$remote_path" = /* ]];then
+		path_parts="${remote_path#/}"
+		current=
+	else
+		path_parts="$remote_path"
+		current=
+	fi
+
+	old_ifs="$IFS"
+	IFS=/
+	for segment in $path_parts;do
+		[ -z "$segment" ] && continue
+		if [[ "$remote_path" = /* ]];then
+			current="${current}/${segment}"
+		elif [ -z "$current" ];then
+			current="$segment"
+		else
+			current="${current}/${segment}"
+		fi
+		printf -- '-mkdir %s\n' "$(sftp_quote "$current")"
+	done
+	IFS="$old_ifs"
+}
+
+function validate_sftp_copy_config(){
+	if [ -z "$SFTP_TARGET" ];then
+		main_log ERROR "SFTP_TARGET is required"
+		return 1
+	fi
+	if [[ "$SFTP_TARGET" != *:* ]];then
+		main_log ERROR "SFTP_TARGET must look like user@host:/remote/path"
+		return 1
+	fi
+}
+
+function sanitize_command(){
+	local arg hide_next output
+	hide_next=
+	output=
+
+	for arg in "$@";do
+		if [ -n "$hide_next" ];then
+			output="${output}${output:+ }<hidden>"
+			hide_next=
+			continue
+		fi
+		case "$arg" in
+			--admpw|--ldappw)
+				output="${output}${output:+ }$arg"
+				hide_next=yes
+			;;
+			--admpw=*|--ldappw=*)
+				output="${output}${output:+ }${arg%%=*}=<hidden>"
+			;;
+			(*)
+				output="${output}${output:+ }$arg"
+			;;
+		esac
+	done
+	printf '%s' "$output"
+}
+
+function marker_file(){
+	local job_type="$1"
+	local job_time="$2"
+	local job_date="$3"
+	local marker_status="${4:-done}"
+	job_time="${job_time/:/}"
+	printf '%s/%s-%s-%s.%s' "$SCHEDULER_STATE_DIR" "$job_type" "$job_time" "$job_date" "$marker_status"
+}
+
+function run_rsync(){
+	local cmd source_path opt ret
+
+	source_path="${WORKDIR%/}/"
+	cmd=(rsync)
+	for opt in $RSYNC_OPTIONS;do
+		cmd+=("$opt")
+	done
+	[ "$RSYNC_DELETE" = yes ] && cmd+=("--delete-after")
+	[ -n "$RSYNC_BWLIMIT" ] && cmd+=("--bwlimit=$RSYNC_BWLIMIT")
+	[ -n "$RSYNC_SSH_PORT" ] && cmd+=("-e" "ssh -p $RSYNC_SSH_PORT")
+	cmd+=("$source_path" "$RSYNC_TARGET")
+
+	main_log INFO "Starting rsync: $(sanitize_command "${cmd[@]}")"
+	"${cmd[@]}"
+	ret=$?
+	if [ "$ret" -eq 0 ];then
+		main_log OK "Rsync completed to $RSYNC_TARGET"
+	else
+		main_log ERROR "Rsync failed with status $ret"
+	fi
+	return "$ret"
+}
+
+function run_sftp(){
+	local cmd source_path login remote_path target batch_file opt ret
+
+	validate_sftp_copy_config || return 1
+	source_path="${WORKDIR%/}"
+	if [ ! -d "$source_path" ];then
+		main_log ERROR "WORKDIR does not exist for sftp copy: $source_path"
+		return 1
+	fi
+
+	target="$SFTP_TARGET"
+	login="${target%%:*}"
+	remote_path="${target#*:}"
+	[ -z "$remote_path" ] && remote_path=.
+	batch_file=$(mktemp)
+
+	{
+		write_sftp_mkdirs "$remote_path"
+		printf 'cd %s\n' "$(sftp_quote "$remote_path")"
+		printf 'lcd %s\n' "$(sftp_quote "$source_path")"
+		printf 'put -p -r *\n'
+	} > "$batch_file"
+
+	cmd=(sftp -b "$batch_file")
+	[ -n "$SFTP_PORT" ] && cmd+=(-P "$SFTP_PORT")
+	[ -n "$SFTP_IDENTITY_FILE" ] && cmd+=(-i "$SFTP_IDENTITY_FILE")
+	for opt in $SFTP_OPTIONS;do
+		cmd+=("$opt")
+	done
+	cmd+=("$login")
+
+	main_log INFO "Starting sftp copy to $SFTP_TARGET"
+	"${cmd[@]}"
+	ret=$?
+	rm -f "$batch_file"
+	if [ "$ret" -eq 0 ];then
+		main_log OK "Sftp copy completed to $SFTP_TARGET"
+	else
+		main_log ERROR "Sftp copy failed with status $ret"
+	fi
+	return "$ret"
+}
+
+function run_remote_copy(){
+	[ "$REMOTE_COPY_ENABLED" = yes ] || return 0
+	case "$REMOTE_COPY_METHOD" in
+		rsync) run_rsync ;;
+		sftp) run_sftp ;;
+		*) main_log ERROR "Unknown remote copy method $REMOTE_COPY_METHOD"; return 1 ;;
+	esac
+}
+
+function run_backup_job(){
+	local job_type="$1"
+	local args ret
+
+	case "$job_type" in
+		full) args="$FULL_BACKUP_ARGS" ;;
+		inc) args="$INCREMENTAL_BACKUP_ARGS" ;;
+		*) main_log ERROR "Unknown job type $job_type"; return 1 ;;
+	esac
+
+	main_log INFO "Starting $job_type backup: $(sanitize_command "$OSE_BIN" $args)"
+	"$OSE_BIN" $args
+	ret=$?
+	if [ "$ret" -eq 0 ];then
+		main_log OK "$job_type backup completed"
+		run_remote_copy || true
+	else
+		main_log ERROR "$job_type backup failed with status $ret"
+	fi
+	return "$ret"
+}
+
+function run_scheduled_job(){
+	local job_type="$1"
+	local job_time="$2"
+	local job_date="$3"
+	local done_marker failed_marker running_marker attempt max_attempts ret retry_wait
+
+	done_marker=$(marker_file "$job_type" "$job_time" "$job_date" done)
+	failed_marker=$(marker_file "$job_type" "$job_time" "$job_date" failed)
+	running_marker=$(marker_file "$job_type" "$job_time" "$job_date" running)
+	[ -e "$done_marker" ] && return 0
+
+	attempt=1
+	max_attempts=$(( BACKUP_RETRY_COUNT + 1 ))
+	retry_wait="$BACKUP_RETRY_WAIT_SECONDS"
+	main_log INFO "Schedule matched: $job_type at $job_time"
+	while [ "$attempt" -le "$max_attempts" ];do
+		printf '%s %s %s attempt=%s\n' "$(date '+%F %T')" "$job_type" "$job_time" "$attempt" > "$running_marker"
+		main_log INFO "Starting scheduled $job_type attempt $attempt/$max_attempts"
+		run_backup_job "$job_type"
+		ret=$?
+		rm -f "$running_marker"
+		if [ "$ret" -eq 0 ];then
+			rm -f "$failed_marker"
+			printf '%s %s %s attempts=%s\n' "$(date '+%F %T')" "$job_type" "$job_time" "$attempt" > "$done_marker"
+			main_log OK "Scheduled $job_type completed at $job_time after $attempt attempt(s)"
+			return 0
+		fi
+		printf '%s %s %s attempt=%s status=%s\n' "$(date '+%F %T')" "$job_type" "$job_time" "$attempt" "$ret" > "$failed_marker"
+		if [ "$attempt" -lt "$max_attempts" ];then
+			main_log ERROR "Scheduled $job_type attempt $attempt/$max_attempts failed with status $ret; retrying in ${retry_wait}s"
+			[ "$retry_wait" -gt 0 ] && sleep "$retry_wait"
+		fi
+		attempt=$(( attempt + 1 ))
+	done
+	main_log ERROR "Scheduled $job_type failed at $job_time after $max_attempts attempt(s)"
+	return "$ret"
+}
+
+function run_due_jobs(){
+	local now_date now_hm time_value
+
+	[ "$SCHEDULER_ENABLED" = yes ] || return 0
+	now_date="${ZMBKPOSE_TEST_DATE:-$(date '+%F')}"
+	now_hm="${ZMBKPOSE_TEST_HM:-$(date '+%H:%M')}"
+
+	if [ "$now_hm" = "$FULL_BACKUP_TIME" ];then
+		run_scheduled_job full "$FULL_BACKUP_TIME" "$now_date"
+		return 0
+	fi
+	for time_value in $(normalize_time_list "$INCREMENTAL_BACKUP_TIMES");do
+		if [ "$now_hm" = "$time_value" ];then
+			run_scheduled_job inc "$time_value" "$now_date"
+		fi
+	done
+}
+
+function cleanup_old_markers(){
+	find "$SCHEDULER_STATE_DIR" -type f \( -name '*.done' -o -name '*.failed' -o -name '*.running' \) -mtime +45 -exec rm -f '{}' \; 2>/dev/null || true
+}
+
+load_config
+setup_logging
+validate_config || exit 1
+
+case "${1:-}" in
+	--check-config)
+		main_log OK "Configuration check passed"
+		exit 0
+	;;
+	--run-once)
+		case "${2:-}" in
+			full|inc) run_backup_job "$2"; exit $? ;;
+			due) run_due_jobs; exit $? ;;
+			copy) run_remote_copy; exit $? ;;
+			rsync) run_rsync; exit $? ;;
+			sftp) run_sftp; exit $? ;;
+			*) main_log ERROR "Usage: $0 --run-once full|inc|due|copy|rsync|sftp"; exit 1 ;;
+		esac
+	;;
+	"") true ;;
+	*) main_log ERROR "Usage: $0 [--check-config|--run-once full|inc|due|copy|rsync|sftp]"; exit 1 ;;
+esac
+
+main_log INFO "zmbkposev3 scheduler started"
+cleanup_old_markers
+while true;do
+	run_due_jobs || true
+	sleep "$SCHEDULER_SLEEP_SECONDS"
+done

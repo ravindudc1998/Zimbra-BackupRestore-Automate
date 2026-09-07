@@ -1,0 +1,132 @@
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          zmbkposev3
+# Required-Start:    $remote_fs $network
+# Required-Stop:     $remote_fs $network
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: zmbkposev3 scheduled backup service
+### END INIT INFO
+
+PATH=/sbin:/usr/sbin:/bin:/usr/bin:/usr/local/bin
+NAME=zmbkposev3
+DESC="zmbkposev3 scheduled backup service"
+DAEMON=/usr/local/bin/zmbkposev3-main
+PIDFILE=/var/run/zmbkpose/zmbkposev3-main.pid
+CONF=/etc/zmbkposev3/zmbkpose.conf
+RUN_AS_USER=zimbra
+MAIN_LOG_FILE=/var/log/zmbkpose/zmbkpose-main.log
+CHECK_ZIMBRA_ON_SERVICE_START=yes
+ZIMBRA_CONTROL=/opt/zimbra/bin/zmcontrol
+EXTRA_COMMAND_PATHS=/opt/zimbra/bin:/opt/zimbra/common/bin:/opt/zimbra/openldap/bin:/opt/zimbra/postfix/sbin
+
+[ -r "$CONF" ] && . "$CONF"
+[ -n "$EXTRA_COMMAND_PATHS" ] && PATH="$EXTRA_COMMAND_PATHS:$PATH"
+export PATH
+[ -n "$SERVICE_USER" ] && RUN_AS_USER="$SERVICE_USER"
+[ -n "$SCHEDULER_PID_FILE" ] && PIDFILE="$SCHEDULER_PID_FILE"
+[ -z "$CHECK_ZIMBRA_ON_SERVICE_START" ] && CHECK_ZIMBRA_ON_SERVICE_START=yes
+[ -z "$ZIMBRA_CONTROL" ] && ZIMBRA_CONTROL=/opt/zimbra/bin/zmcontrol
+
+log_msg()
+{
+	LOGDIR="${MAIN_LOG_FILE%/*}"
+	mkdir -p "$LOGDIR" 2>/dev/null || true
+	printf '%s INIT: %s\n' "$(date '+%F %T')" "$*" >> "$MAIN_LOG_FILE" 2>/dev/null || true
+}
+
+is_running()
+{
+	[ -s "$PIDFILE" ] || return 1
+	kill -0 "$(cat "$PIDFILE")" 2>/dev/null
+}
+
+require_zimbra_running()
+{
+	if [ "$CHECK_ZIMBRA_ON_SERVICE_START" = no ];then
+		log_msg "zimbra running check skipped"
+		return 0
+	fi
+
+	if [ ! -x "$ZIMBRA_CONTROL" ];then
+		echo "Zimbra control command not found: $ZIMBRA_CONTROL" >&2
+		log_msg "zimbra check failed: control command not found: $ZIMBRA_CONTROL"
+		return 1
+	fi
+
+	ZIMBRA_STATUS_OUTPUT=$(su - "$RUN_AS_USER" -c "$ZIMBRA_CONTROL status" 2>&1)
+	ZIMBRA_STATUS_RC=$?
+	printf '%s\n' "$ZIMBRA_STATUS_OUTPUT" | while IFS= read -r ZIMBRA_STATUS_LINE;do
+		[ -z "$ZIMBRA_STATUS_LINE" ] || log_msg "zimbra status: $ZIMBRA_STATUS_LINE"
+	done
+
+	if [ "$ZIMBRA_STATUS_RC" -ne 0 ];then
+		echo "Zimbra status check failed. Start Zimbra before starting $DESC." >&2
+		log_msg "zimbra check failed: zmcontrol status exit $ZIMBRA_STATUS_RC"
+		return 1
+	fi
+	if printf '%s\n' "$ZIMBRA_STATUS_OUTPUT" | grep -Eq 'Stopped|not running';then
+		echo "Zimbra is not fully running. Start Zimbra before starting $DESC." >&2
+		log_msg "zimbra check failed: stopped service detected"
+		return 1
+	fi
+	if ! printf '%s\n' "$ZIMBRA_STATUS_OUTPUT" | grep -Eq '(^|[[:space:]])Running([[:space:]]|$)';then
+		echo "Zimbra does not look running. Start Zimbra before starting $DESC." >&2
+		log_msg "zimbra check failed: no running service found"
+		return 1
+	fi
+
+	log_msg "zimbra check passed"
+	return 0
+}
+
+case "$1" in
+	start)
+		require_zimbra_running || exit 1
+		if is_running;then
+			echo "$DESC already running"
+			exit 0
+		fi
+		echo "Starting $DESC"
+		log_msg "start requested"
+		PIDDIR="${PIDFILE%/*}"
+		mkdir -p "$PIDDIR"
+		chown "$RUN_AS_USER" "$PIDDIR" 2>/dev/null || true
+		start-stop-daemon --start --background --make-pidfile --pidfile "$PIDFILE" \
+			--chuid "$RUN_AS_USER" --exec "$DAEMON"
+		log_msg "start completed"
+	;;
+	stop)
+		if ! is_running;then
+			echo "$DESC not running"
+			log_msg "stop requested but service was not running"
+			rm -f "$PIDFILE"
+			exit 0
+		fi
+		echo "Stopping $DESC"
+		log_msg "stop requested"
+		start-stop-daemon --stop --pidfile "$PIDFILE" --retry TERM/30/KILL/5
+		rm -f "$PIDFILE"
+		log_msg "stop completed"
+	;;
+	restart|force-reload)
+		"$0" stop
+		"$0" start
+	;;
+	status)
+		if is_running;then
+			echo "$DESC is running (pid $(cat "$PIDFILE"))"
+			log_msg "status running pid $(cat "$PIDFILE")"
+			exit 0
+		fi
+		echo "$DESC is not running"
+		log_msg "status not running"
+		exit 3
+	;;
+	*)
+		echo "Usage: $0 {start|stop|restart|force-reload|status}"
+		exit 1
+	;;
+esac
+
+exit 0
