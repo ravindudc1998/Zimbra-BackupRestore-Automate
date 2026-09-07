@@ -1,0 +1,30 @@
+# Runtime config and secrets
+zmbkpose.conf
+*.local
+*.secret
+*.password
+
+# SSH/SFTP private keys
+id_*
+*_sftp
+*.pem
+
+# Backup archives and generated backup data
+*.tar
+*.tgz
+mailbackup-files/
+backup/
+backups/
+
+# Logs and runtime state
+*.log
+*.pid
+*.done
+*.failed
+*.running
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+*.swp
+*.tmp

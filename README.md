@@ -1,7 +1,9 @@
-# Zmbkpose v3
+# Zmbkpose v3 - Zimbra Backup and Restore Automation
 
-`zmbkposev3` is a Bash tool for hot backup and restore of Zimbra Collaboration
-Open Source Edition accounts.
+`zmbkposev3` is a Bash tool for Zimbra backup and restore automation. It
+supports hot backup and restore of Zimbra Collaboration Open Source Edition
+accounts, including full backups, incremental backups, verification, scheduled
+backups, and optional remote copy to rsync or SFTP storage.
 
 It backs up:
 
@@ -36,6 +38,18 @@ bare-metal recovery plan.
 - Optional remote copy by `rsync` or `sftp`
 - Optional SFTP SSH key generation during install
 - Safe uninstaller
+
+## What This Solves
+
+Use Zmbkpose v3 when you need a practical Zimbra Open Source Edition backup
+tool for daily mail operations, including:
+
+- Zimbra OSE mailbox backup and restore
+- Zimbra full backup and incremental backup automation
+- Zimbra account-level restore from backup archives
+- Zimbra backup verification before marking a backup as usable
+- Scheduled Zimbra backups on Ubuntu or similar Linux servers
+- Remote Zimbra backup copy to SFTP, TrueNAS, FreeNAS, or rsync storage
 
 ## Requirements
 

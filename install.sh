@@ -733,12 +733,12 @@ Note: --------------------------------------------------------------------------
 --------------------------------------------------------------------------------
 	EOF
 
-if read_y_n_question "Install completed. Do you want to display the README file?" ;then
+if read_y_n_question "Install completed. Do you want to display the README.md file?" ;then
   if [ -c /dev/tty ];then
-    less "$MYDIR/README" </dev/tty >/dev/tty
-    echo "README displayed from $MYDIR/README"
+    less "$MYDIR/README.md" </dev/tty >/dev/tty
+    echo "README.md displayed from $MYDIR/README.md"
   else
-    less "$MYDIR/README"
+    less "$MYDIR/README.md"
   fi
 fi
 
