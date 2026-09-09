@@ -348,12 +348,22 @@ FULL_BACKUP_ARGS="-f"
 INCREMENTAL_BACKUP_ARGS="-i -t"
 BACKUP_RETRY_COUNT=3
 BACKUP_RETRY_WAIT_SECONDS=300
+MAILBOX_EXPORT_RETRY_COUNT=4
+MAILBOX_EXPORT_RETRY_WAIT_SECONDS=3
 ```
 
-Config changes are loaded on service restart:
+The scheduler reloads backup times and retry settings while it is running.
+Restart is still recommended after changing service-level settings such as
+`SERVICE_USER`, `SCHEDULER_PID_FILE`, or `MAIN_LOG_FILE`:
 
 ```bash
 sudo /etc/init.d/zmbkposev3 restart
+```
+
+Test a schedule match without waiting for the real time:
+
+```bash
+sudo -u zimbra env ZMBKPOSE_TEST_DATE=2026-09-07 ZMBKPOSE_TEST_HM=18:00 /usr/local/bin/zmbkposev3-main --run-once due
 ```
 
 The service checks Zimbra before start/restart:
@@ -522,21 +532,43 @@ The mailbox export returned something that is not a valid tar-gzip mailbox
 archive. Common causes:
 
 - wrong admin username or password
+- unquoted password in `zmbkpose.conf`, especially if it contains `#`, `$`, or spaces
 - Zimbra mailbox service is not running
 - mailbox export URL failed
 - proxy or certificate problem
 - account/mailhost mismatch
 
-Try a manual backup for one account and inspect the log:
+Try a manual backup for one account. Manual runs print the details to the
+terminal. Scheduled runs write the same details to `zmbkpose-main.log`.
+Newer versions log the HTTP status, content type, download size, and the first
+line of the invalid response:
 
 ```bash
 sudo -u zimbra zmbkposev3 -f -a alice@example.com
 tail -100 /var/log/zmbkpose/zmbkpose-main.log
 ```
 
-Service starts, but new config is not applied
+`http_code=204 size_download=0` means Zimbra returned no mailbox content. This
+can happen for an empty mailbox or an incremental backup where no messages match
+the time query. Zmbkpose v3 treats this as a successful empty mailbox export and
+creates a valid empty `mailbox.tgz`.
 
-Restart is required after config changes:
+Incremental schedule does not run
+
+Check what the scheduler loaded:
+
+```bash
+tail -100 /var/log/zmbkpose/zmbkpose-main.log
+```
+
+You should see a line similar to:
+
+```text
+INFO: Loaded scheduler config: enabled=yes full=00:00 incremental="06:00 09:00 18:00 21:00"
+```
+
+If the config was edited recently, restart the service or wait up to
+`SCHEDULER_SLEEP_SECONDS` for the scheduler to reload it:
 
 ```bash
 sudo /etc/init.d/zmbkposev3 restart

@@ -6,16 +6,53 @@ OSE_BIN="/usr/local/bin/zmbkposev3"
 LOG_DIR="/var/log/zmbkpose"
 MAIN_LOG_FILE="$LOG_DIR/zmbkpose-main.log"
 STATE_DIR="/var/lib/zmbkpose"
-EXTRA_COMMAND_PATHS="/opt/zimbra/bin:/opt/zimbra/common/bin:/opt/zimbra/openldap/bin:/opt/zimbra/postfix/sbin"
+DEFAULT_EXTRA_COMMAND_PATHS="/opt/zimbra/bin:/opt/zimbra/common/bin:/opt/zimbra/openldap/bin:/opt/zimbra/postfix/sbin"
+EXTRA_COMMAND_PATHS="$DEFAULT_EXTRA_COMMAND_PATHS"
+BASE_PATH="$PATH"
+LAST_SCHEDULER_SIGNATURE=
+
+function reset_config_defaults(){
+	WORKDIR=
+	SERVICE_USER=zimbra
+	SCHEDULER_ENABLED=yes
+	FULL_BACKUP_TIME=00:00
+	INCREMENTAL_BACKUP_TIMES="06:00 09:00 18:00 21:00"
+	FULL_BACKUP_ARGS="-f"
+	INCREMENTAL_BACKUP_ARGS="-i -t"
+	BACKUP_RETRY_COUNT=3
+	BACKUP_RETRY_WAIT_SECONDS=300
+	SCHEDULER_SLEEP_SECONDS=30
+	SCHEDULER_STATE_DIR="$STATE_DIR"
+	SCHEDULER_PID_FILE="/var/run/zmbkpose/zmbkposev3-main.pid"
+	MAIN_LOG_FILE="$LOG_DIR/zmbkpose-main.log"
+	BACKUP_KEEP_FULL=0
+	RSYNC_ENABLED=no
+	REMOTE_COPY_ENABLED=
+	REMOTE_COPY_METHOD=rsync
+	RSYNC_TARGET=
+	RSYNC_OPTIONS="-a --partial --delay-updates"
+	RSYNC_DELETE=no
+	RSYNC_BWLIMIT=
+	RSYNC_SSH_PORT=
+	SFTP_TARGET=
+	SFTP_PORT=22
+	SFTP_IDENTITY_FILE=
+	SFTP_OPTIONS="-oBatchMode=yes -oStrictHostKeyChecking=accept-new"
+	EXTRA_COMMAND_PATHS="$DEFAULT_EXTRA_COMMAND_PATHS"
+}
 
 function load_config(){
 	if [ ! -r "$OSE_CONF/zmbkpose.conf" ];then
 		echo "$(date '+%F %T') ERROR: Cannot read config file $OSE_CONF/zmbkpose.conf" >&2
-		exit 1
+		return 1
 	fi
-	source "$OSE_CONF/zmbkpose.conf"
-	[ -z "$EXTRA_COMMAND_PATHS" ] && EXTRA_COMMAND_PATHS="/opt/zimbra/bin:/opt/zimbra/common/bin:/opt/zimbra/openldap/bin:/opt/zimbra/postfix/sbin"
-	PATH="$EXTRA_COMMAND_PATHS:$PATH"
+	reset_config_defaults
+	if ! source <(sed 's/\r$//' "$OSE_CONF/zmbkpose.conf");then
+		echo "$(date '+%F %T') ERROR: Cannot load config file $OSE_CONF/zmbkpose.conf" >&2
+		return 1
+	fi
+	[ -z "$EXTRA_COMMAND_PATHS" ] && EXTRA_COMMAND_PATHS="$DEFAULT_EXTRA_COMMAND_PATHS"
+	PATH="$EXTRA_COMMAND_PATHS:$BASE_PATH"
 	export PATH
 	[ -z "$SERVICE_USER" ] && SERVICE_USER=zimbra
 	[ -z "$SCHEDULER_ENABLED" ] && SCHEDULER_ENABLED=yes
@@ -37,12 +74,17 @@ function load_config(){
 	[ -z "$RSYNC_DELETE" ] && RSYNC_DELETE=no
 	[ -z "$SFTP_PORT" ] && SFTP_PORT=22
 	[ -z "$SFTP_OPTIONS" ] && SFTP_OPTIONS="-oBatchMode=yes -oStrictHostKeyChecking=accept-new"
+	return 0
 }
 
-function setup_logging(){
+function ensure_runtime_dirs(){
 	local main_log_dir
 	main_log_dir="${MAIN_LOG_FILE%/*}"
 	mkdir -p "$main_log_dir" "$SCHEDULER_STATE_DIR"
+}
+
+function setup_logging(){
+	ensure_runtime_dirs || exit 1
 	touch "$MAIN_LOG_FILE"
 	exec >> "$MAIN_LOG_FILE" 2>&1
 }
@@ -58,11 +100,38 @@ function valid_time(){
 }
 
 function normalize_time_list(){
-	local time_value
-	for time_value in ${1//,/ };do
+	local raw time_value
+	raw="${1//$'\r'/}"
+	raw="${raw//,/ }"
+	for time_value in $raw;do
 		[ -z "$time_value" ] && continue
 		printf '%s\n' "$time_value"
 	done
+}
+
+function inline_time_list(){
+	local time_value output
+	output=
+	for time_value in $(normalize_time_list "$1");do
+		output="${output}${output:+ }$time_value"
+	done
+	printf '%s' "$output"
+}
+
+function scheduler_signature(){
+	printf 'enabled=%s full=%s incremental="%s" sleep=%s retry=%s wait=%s remote=%s/%s' \
+		"$SCHEDULER_ENABLED" "$FULL_BACKUP_TIME" \
+		"$(inline_time_list "$INCREMENTAL_BACKUP_TIMES")" \
+		"$SCHEDULER_SLEEP_SECONDS" "$BACKUP_RETRY_COUNT" \
+		"$BACKUP_RETRY_WAIT_SECONDS" "$REMOTE_COPY_ENABLED" "$REMOTE_COPY_METHOD"
+}
+
+function log_scheduler_config(){
+	local signature
+	signature=$(scheduler_signature)
+	[ "$signature" = "$LAST_SCHEDULER_SIGNATURE" ] && return 0
+	LAST_SCHEDULER_SIGNATURE="$signature"
+	main_log INFO "Loaded scheduler config: $signature"
 }
 
 function validate_config(){
@@ -383,9 +452,10 @@ function cleanup_old_markers(){
 	find "$SCHEDULER_STATE_DIR" -type f \( -name '*.done' -o -name '*.failed' -o -name '*.running' \) -mtime +45 -exec rm -f '{}' \; 2>/dev/null || true
 }
 
-load_config
+load_config || exit 1
 setup_logging
 validate_config || exit 1
+log_scheduler_config
 
 case "${1:-}" in
 	--check-config)
@@ -409,6 +479,9 @@ esac
 main_log INFO "zmbkposev3 scheduler started"
 cleanup_old_markers
 while true;do
-	run_due_jobs || true
+	if load_config && validate_config && ensure_runtime_dirs;then
+		log_scheduler_config
+		run_due_jobs || true
+	fi
 	sleep "$SCHEDULER_SLEEP_SECONDS"
 done

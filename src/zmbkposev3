@@ -38,6 +38,8 @@ HUMAN_DATE_FORMAT="%d/%m/%Y %H:%M:%S"
 DATE_TIME_MARK_FORMAT='%Y%m%d%H%M%S' #alphanumeric time sortable by the "sort" command
 CURL_args="-s -S -k -f"
 EXTRA_COMMAND_PATHS="/opt/zimbra/bin:/opt/zimbra/common/bin:/opt/zimbra/openldap/bin:/opt/zimbra/postfix/sbin"
+MAILBOX_EXPORT_RETRY_COUNT=4
+MAILBOX_EXPORT_RETRY_WAIT_SECONDS=3
 LDAP_FILE_IN_TAR=acct.ldif
 MAILBOX_FILE_IN_TAR=mailbox.tgz
 OSE_CONF="/etc/zmbkposev3"
@@ -519,6 +521,43 @@ function zimbra_ldap_backup()
 	ldap_search "(zimbraAliasTargetId=$zimbraId)" >> "$backup_file"
 }
 
+function mailbox_export_invalid_detail(){
+	local mailbox="$1"
+	local backup_file="$2"
+	local curl_meta="$3"
+	local bytes first_line
+
+	bytes=$($WC_cmd -c < "$backup_file" 2>/dev/null | $AWK_cmd '{print $1}')
+	[ -z "$bytes" ] && bytes=0
+	first_line=$($SED_cmd -n '1p' "$backup_file" 2>/dev/null | \
+		$SED_cmd 's/[^[:print:]\t]/?/g' | \
+		$SED_cmd 's/[[:space:]][[:space:]]*/ /g' | \
+		$SED_cmd 's/^\(.\{0,160\}\).*/\1/')
+	first_line="${first_line//\"/\'}"
+
+	if [ -n "$first_line" ];then
+		debug "$mailbox - invalid mailbox export details: curl=[$curl_meta], bytes=$bytes, first-line=\"$first_line\""
+	else
+		debug "$mailbox - invalid mailbox export details: curl=[$curl_meta], bytes=$bytes"
+	fi
+}
+
+function mailbox_export_is_no_content(){
+	case "$1" in
+		(*http_code=204*)
+			return 0
+		;;
+	esac
+	return 1
+}
+
+function create_empty_mailbox_tgz(){
+	local mailbox_file="$1"
+
+	$RM_cmd -f "$mailbox_file" 2>/dev/null || true
+	( set -o pipefail; $TAR_cmd -cf - -T /dev/null | $GZIP_cmd -c > "$mailbox_file" )
+	mailbox_tgz_is_valid "$mailbox_file"
+}
 
 function zimbra_mailbox_backup()
 {
@@ -526,25 +565,39 @@ function zimbra_mailbox_backup()
 	local mailhost="$2"
 	local search_query="$3"
 	local backup_file="$4"
-	local ret i
+	local ret i max_attempts retry_wait curl_meta_file curl_meta
 
 	[ -n "$search_query" ] && search_query="&$search_query"
+	max_attempts="${MAILBOX_EXPORT_RETRY_COUNT:-4}"
+	retry_wait="${MAILBOX_EXPORT_RETRY_WAIT_SECONDS:-3}"
 
 	#Because sporadic ssl error, we will try several times. See issues 35.
-	for i in 1 2 3 4;do
+	i=1
+	while [ "$i" -le "$max_attempts" ];do
 		$RM_cmd -f "$backup_file" 2>/dev/null || true
+		curl_meta_file=$($MKTEMP_cmd "${TMPDIR:-/tmp}/zmbkpose-curl-meta.XXXXXX")
+		curl_meta=
 		ret=0; $CURL_cmd $CURL_args -u "$ADMINUSER:$ADMINPASS" -o "$backup_file" \
-			"https://$mailhost:7071/home/$mailbox/?fmt=tgz$search_query" || ret=$?
+			-w 'http_code=%{http_code} content_type=%{content_type} size_download=%{size_download}' \
+			"https://$mailhost:7071/home/$mailbox/?fmt=tgz$search_query" > "$curl_meta_file" || ret=$?
+		curl_meta=$(<"$curl_meta_file")
+		$RM_cmd -f "$curl_meta_file" 2>/dev/null || true
 		if [ "$ret" -eq 0 ];then
 			if mailbox_tgz_is_valid "$backup_file";then
 				return 0
 			fi
-			debug "$mailbox - mailbox export try $i returned invalid tgz"
+			if mailbox_export_is_no_content "$curl_meta";then
+				debug "$mailbox - mailbox export returned HTTP 204 No Content; creating valid empty $MAILBOX_FILE_IN_TAR"
+				create_empty_mailbox_tgz "$backup_file" && return 0
+			fi
+			debug "$mailbox - mailbox export try $i returned invalid tgz ($curl_meta)"
+			mailbox_export_invalid_detail "$mailbox" "$backup_file" "$curl_meta"
 			ret=90
 		else
-			debug "$mailbox - mailbox export try $i failed with curl code $ret"
+			debug "$mailbox - mailbox export try $i failed with curl code $ret ($curl_meta)"
 		fi
-		[ "$i" -lt 4 ] && sleep 3
+		[ "$i" -lt "$max_attempts" ] && sleep "$retry_wait"
+		i=$(( i + 1 ))
 	done
 	error "$mailbox - Mailbox backup failed or returned invalid tgz after several attempts"
 	return 1
@@ -1536,13 +1589,15 @@ if [ ! -r "$OSE_CONF/zmbkpose.conf" ];then
 	echo "ERROR:Cannot read config file \"$OSE_CONF/zmbkpose.conf\"" >&2
 	exit 1
 fi
-source "$OSE_CONF/zmbkpose.conf"
+source <(sed 's/\r$//' "$OSE_CONF/zmbkpose.conf")
 ZMBKPOSE_ORIGINAL_ARGS=("$@")
 [ -z "$EXTRA_COMMAND_PATHS" ] && EXTRA_COMMAND_PATHS="/opt/zimbra/bin:/opt/zimbra/common/bin:/opt/zimbra/openldap/bin:/opt/zimbra/postfix/sbin"
 PATH="$EXTRA_COMMAND_PATHS:$PATH"
 export PATH
 [ -z "$VERIFY_BACKUP_AFTER_CREATE" ] && VERIFY_BACKUP_AFTER_CREATE=yes
 [ -z "$BACKUP_KEEP_FULL" ] && BACKUP_KEEP_FULL=0
+[ -z "$MAILBOX_EXPORT_RETRY_COUNT" ] && MAILBOX_EXPORT_RETRY_COUNT=4
+[ -z "$MAILBOX_EXPORT_RETRY_WAIT_SECONDS" ] && MAILBOX_EXPORT_RETRY_WAIT_SECONDS=3
 [ -z "$COLOR_MODE" ] && COLOR_MODE=auto
 [ -z "$QUIET_MODE" ] && QUIET_MODE=no
 if [ -n "$WORKDIR" -a "$WORKDIR" != "/" ];then
@@ -1581,6 +1636,16 @@ if ! normalized_backup_keep_full=$(is_a_number "$BACKUP_KEEP_FULL") || [ -z "$no
 	exit 1
 fi
 BACKUP_KEEP_FULL="$normalized_backup_keep_full"
+if ! normalized_mailbox_export_retry_count=$(is_a_number "$MAILBOX_EXPORT_RETRY_COUNT") || [ -z "$normalized_mailbox_export_retry_count" ] || [ "$normalized_mailbox_export_retry_count" -le 0 ];then
+	error "CONFIG: Incorrect MAILBOX_EXPORT_RETRY_COUNT \"$MAILBOX_EXPORT_RETRY_COUNT\". Use a positive number."
+	exit 1
+fi
+MAILBOX_EXPORT_RETRY_COUNT="$normalized_mailbox_export_retry_count"
+if ! normalized_mailbox_export_retry_wait=$(is_a_number "$MAILBOX_EXPORT_RETRY_WAIT_SECONDS") || [ -z "$normalized_mailbox_export_retry_wait" ];then
+	error "CONFIG: Incorrect MAILBOX_EXPORT_RETRY_WAIT_SECONDS \"$MAILBOX_EXPORT_RETRY_WAIT_SECONDS\". Use 0 or a positive number."
+	exit 1
+fi
+MAILBOX_EXPORT_RETRY_WAIT_SECONDS="$normalized_mailbox_export_retry_wait"
 
 # Criticize the parameters passed on the command line
 while [ -n "$1" ];do
